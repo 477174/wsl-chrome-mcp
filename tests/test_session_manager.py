@@ -329,12 +329,17 @@ class TestSessionManagerTabOperations:
     async def test_create_tab_adds_to_session(self) -> None:
         """Should create a new tab and add it to session state."""
         manager, state = await self._setup_manager()
-        browser = await manager._ensure_browser_session()
+        target1 = make_target("T1")
         target2 = make_target("T2", "https://example.com")
         session2 = make_cdp_session("T2")
 
-        browser.send = AsyncMock(return_value={"targetId": "T2"})
-        manager._cdp.list_targets = AsyncMock(return_value=[target2])
+        # Mock the current session's send (for window.open via evaluate_javascript)
+        state.current_session.send = AsyncMock(return_value={"result": {}})
+
+        # Mock list_targets: first call returns only T1, second call returns T1+T2
+        manager._cdp.list_targets = AsyncMock(
+            side_effect=[[target1], [target1, target2], [target1, target2]]
+        )
         manager._cdp.connect_to_target = AsyncMock(return_value=session2)
 
         target_id = await manager.create_tab_in_session("ses_test", "https://example.com")

@@ -274,10 +274,16 @@ class TestProxySessionManagerTabOperations:
     async def test_create_tab_adds_to_session(self) -> None:
         """Should create a new tab and add it to session state."""
         manager, state = await self._setup_manager()
+        target1 = make_page_target("T1")
         target2 = make_page_target("T2", "https://example.com")
 
-        manager._proxy.send_cdp_command = AsyncMock(return_value={"targetId": "T2"})
-        manager._proxy.list_targets = AsyncMock(return_value=[target2])
+        # Mock evaluate (for window.open call)
+        manager._proxy.evaluate = AsyncMock(return_value=None)
+
+        # Mock list_targets: first call returns only T1, second call returns T1+T2
+        manager._proxy.list_targets = AsyncMock(
+            side_effect=[[target1], [target1, target2], [target1, target2]]
+        )
 
         target_id = await manager.create_tab_in_session("ses_test", "https://example.com")
 

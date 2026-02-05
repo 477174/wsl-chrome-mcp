@@ -325,9 +325,8 @@ class ProxySessionManager:
     async def create_tab_in_session(self, session_id: str, url: str = "about:blank") -> str:
         """Create a new tab in an existing session's window.
 
-        Note: Target.createTarget does not support a windowId param,
-        so the new tab lands in whichever window Chrome decides.
-        We track it in this session regardless.
+        Uses window.open() on the session's current tab to ensure the new
+        tab opens in the same window (not a random window like Target.createTarget).
 
         Args:
             session_id: The session to create the tab in.
@@ -338,33 +337,60 @@ class ProxySessionManager:
 
         Raises:
             KeyError: If session_id is not found.
+            RuntimeError: If the session has no current tab or tab creation fails.
         """
         state = self._sessions[session_id]
-        browser_ws = await self._ensure_browser_ws_url()
 
-        result = await self._proxy.send_cdp_command(
-            browser_ws,
-            "Target.createTarget",
-            {"url": url},
+        if state.current_ws_url is None:
+            raise RuntimeError(f"Session {session_id} has no current tab to open from")
+
+        # Snapshot current targets
+        before_targets = await self._proxy.list_targets()
+        before = {t["id"] for t in before_targets if t.get("type") == "page"}
+
+        # Open new tab via window.open() on the current page
+        # This ensures the tab opens in the SAME window as the opener
+        import json
+
+        await self._proxy.evaluate(
+            state.current_ws_url,
+            f"window.open({json.dumps(url)}, '_blank')",
         )
-        target_id = result["targetId"]
-        logger.info(
-            "Session %s: new tab %s -> %s",
-            session_id,
-            target_id,
-            url,
-        )
+
+        # Poll for the new target (longer intervals for proxy mode)
+        new_target_id: str | None = None
+        for attempt in range(15):
+            await asyncio.sleep(0.5)
+            after_targets = await self._proxy.list_targets()
+            after = {t["id"] for t in after_targets if t.get("type") == "page"}
+            new_ids = after - before
+            if new_ids:
+                new_target_id = new_ids.pop()
+                logger.info(
+                    "Session %s: new tab %s -> %s (attempt %d)",
+                    session_id,
+                    new_target_id,
+                    url,
+                    attempt + 1,
+                )
+                break
+
+        if new_target_id is None:
+            raise RuntimeError(
+                f"Failed to create new tab in session {session_id}: "
+                "no new target appeared after window.open()"
+            )
 
         # Get WebSocket URL for the new target
-        ws_url = await self._get_ws_url_for_target(target_id)
+        ws_url = await self._get_ws_url_for_target(new_target_id)
         if ws_url is None:
-            raise RuntimeError(f"Failed to get WebSocket URL for new target {target_id}")
+            raise RuntimeError(f"Failed to get WebSocket URL for new target {new_target_id}")
 
-        state.targets.append(target_id)
-        state.ws_urls[target_id] = ws_url
-        state.current_target_id = target_id
+        state.targets.append(new_target_id)
+        state.ws_urls[new_target_id] = ws_url
+        state.current_target_id = new_target_id
 
-        return target_id
+        return new_target_id
 
     async def switch_tab_in_session(self, session_id: str, target_id: str) -> str:
         """Switch a session's active tab.
