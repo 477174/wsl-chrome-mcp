@@ -271,6 +271,39 @@ class CDPClient:
         self._sessions[target.id] = session
         return session
 
+    async def connect_to_browser(self) -> CDPSession:
+        """Connect to the browser-level WebSocket endpoint.
+
+        This session is used for browser-wide commands like Target.createTarget,
+        Browser.getWindowForTarget, and Target.activateTarget. Unlike page sessions,
+        this connects to the /json/version webSocketDebuggerUrl.
+
+        Returns:
+            CDPSession connected to the browser endpoint.
+        """
+        if "_browser" in self._sessions:
+            return self._sessions["_browser"]
+
+        version = await self.get_version()
+        ws_url = version.get("webSocketDebuggerUrl")
+        if not ws_url:
+            raise RuntimeError("Chrome did not return browser webSocketDebuggerUrl")
+
+        websocket = await websockets.connect(ws_url)
+        # Create a synthetic target for the browser session
+        browser_target = CDPTarget(
+            id="_browser",
+            type="browser",
+            title="Browser",
+            url="",
+            websocket_url=ws_url,
+        )
+        session = CDPSession(websocket=websocket, target=browser_target)
+        await session.start()
+
+        self._sessions["_browser"] = session
+        return session
+
     async def get_or_create_page(self) -> tuple[CDPTarget, CDPSession]:
         """Get an existing page or create a new one.
 
