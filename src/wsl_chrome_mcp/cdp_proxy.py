@@ -29,7 +29,9 @@ class CDPProxyClient:
         self.port = port
         self._ws_messages: dict[str, list[str]] = {}
 
-    def _make_http_request(self, path: str, method: str = "GET") -> dict[str, Any] | list[Any] | None:
+    def _make_http_request(
+        self, path: str, method: str = "GET"
+    ) -> dict[str, Any] | list[Any] | None:
         """Make an HTTP request to Chrome via PowerShell.
 
         Args:
@@ -39,7 +41,7 @@ class CDPProxyClient:
         Returns:
             Parsed JSON response or None on error.
         """
-        ps_cmd = f'''
+        ps_cmd = f"""
         try {{
             $response = Invoke-WebRequest -Uri "http://localhost:{self.port}{path}" -Method {method} -UseBasicParsing -TimeoutSec 10
             Write-Output $response.Content
@@ -47,7 +49,7 @@ class CDPProxyClient:
             Write-Error $_.Exception.Message
             exit 1
         }}
-        '''
+        """
 
         try:
             result = run_windows_command(ps_cmd, timeout=15.0)
@@ -60,7 +62,19 @@ class CDPProxyClient:
 
     async def get_version(self) -> dict[str, Any] | None:
         """Get Chrome version info."""
-        return self._make_http_request("/json/version")
+        result = self._make_http_request("/json/version")
+        return result if isinstance(result, dict) else None
+
+    async def get_browser_ws_url(self) -> str | None:
+        """Get the browser-level WebSocket URL for Target/Browser domain commands.
+
+        Returns:
+            WebSocket URL like ws://localhost:9222/devtools/browser/xxx or None.
+        """
+        version = await self.get_version()
+        if version:
+            return version.get("webSocketDebuggerUrl")
+        return None
 
     async def list_targets(self) -> list[dict[str, Any]]:
         """List available debugging targets."""
@@ -69,7 +83,8 @@ class CDPProxyClient:
 
     async def new_page(self, url: str = "about:blank") -> dict[str, Any] | None:
         """Create a new page."""
-        return self._make_http_request(f"/json/new?{url}", method="PUT")
+        result = self._make_http_request(f"/json/new?{url}", method="PUT")
+        return result if isinstance(result, dict) else None
 
     async def close_page(self, target_id: str) -> bool:
         """Close a page."""
@@ -134,6 +149,7 @@ class CDPProxyClient:
         }}
         '''
 
+        result = None
         try:
             result = run_windows_command(ps_script, timeout=timeout + 5)
             if result.returncode == 0 and result.stdout.strip():
@@ -143,7 +159,8 @@ class CDPProxyClient:
                 return response.get("result", {})
         except json.JSONDecodeError as e:
             logger.error(f"Failed to parse CDP response: {e}")
-            raise RuntimeError(f"Invalid CDP response: {result.stdout[:200] if result else 'empty'}")
+            stdout_preview = result.stdout[:200] if result and result.stdout else "empty"
+            raise RuntimeError(f"Invalid CDP response: {stdout_preview}")
         except Exception as e:
             logger.error(f"CDP command failed: {e}")
             raise
@@ -155,9 +172,7 @@ class CDPProxyClient:
         await self.send_cdp_command(ws_url, "Page.enable")
         return await self.send_cdp_command(ws_url, "Page.navigate", {"url": url})
 
-    async def screenshot(
-        self, ws_url: str, format: str = "png", full_page: bool = False
-    ) -> bytes:
+    async def screenshot(self, ws_url: str, format: str = "png", full_page: bool = False) -> bytes:
         """Take a screenshot."""
         params: dict[str, Any] = {"format": format}
 
@@ -203,6 +218,7 @@ def should_use_proxy() -> bool:
 
     # Test if we can reach localhost:9222 directly
     import subprocess
+
     try:
         result = subprocess.run(
             ["curl", "-s", "--connect-timeout", "1", "http://localhost:9222/json/version"],
