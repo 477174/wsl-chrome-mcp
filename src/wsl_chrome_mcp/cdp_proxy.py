@@ -6,7 +6,6 @@ all HTTP and WebSocket CDP requests through PowerShell on Windows.
 
 from __future__ import annotations
 
-import asyncio
 import base64
 import json
 import logging
@@ -43,7 +42,8 @@ class CDPProxyClient:
         """
         ps_cmd = f"""
         try {{
-            $response = Invoke-WebRequest -Uri "http://localhost:{self.port}{path}" -Method {method} -UseBasicParsing -TimeoutSec 10
+            $uri = "http://localhost:{self.port}{path}"
+            $response = Invoke-WebRequest -Uri $uri -Method {method} -UseBasicParsing -TimeoutSec 10
             Write-Output $response.Content
         }} catch {{
             Write-Error $_.Exception.Message
@@ -129,7 +129,8 @@ class CDPProxyClient:
             $message = "{message_json}"
             $bytes = [System.Text.Encoding]::UTF8.GetBytes($message)
             $segment = [System.ArraySegment[byte]]::new($bytes)
-            $null = $ws.SendAsync($segment, [System.Net.WebSockets.WebSocketMessageType]::Text, $true, $ct).GetAwaiter().GetResult()
+            $msgType = [System.Net.WebSockets.WebSocketMessageType]::Text
+            $null = $ws.SendAsync($segment, $msgType, $true, $ct).GetAwaiter().GetResult()
 
             # Receive response
             $buffer = New-Object byte[] 65536
@@ -143,7 +144,8 @@ class CDPProxyClient:
             Write-Output $result
         }} finally {{
             if ($ws.State -eq [System.Net.WebSockets.WebSocketState]::Open) {{
-                $null = $ws.CloseAsync([System.Net.WebSockets.WebSocketCloseStatus]::NormalClosure, "", $ct).GetAwaiter().GetResult()
+                $closeStatus = [System.Net.WebSockets.WebSocketCloseStatus]::NormalClosure
+                $null = $ws.CloseAsync($closeStatus, "", $ct).GetAwaiter().GetResult()
             }}
             $ws.Dispose()
         }}
@@ -160,7 +162,7 @@ class CDPProxyClient:
         except json.JSONDecodeError as e:
             logger.error(f"Failed to parse CDP response: {e}")
             stdout_preview = result.stdout[:200] if result and result.stdout else "empty"
-            raise RuntimeError(f"Invalid CDP response: {stdout_preview}")
+            raise RuntimeError(f"Invalid CDP response: {stdout_preview}") from e
         except Exception as e:
             logger.error(f"CDP command failed: {e}")
             raise
