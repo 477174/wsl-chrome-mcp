@@ -9,7 +9,6 @@ import pytest
 
 from wsl_chrome_mcp.chrome_pool import ChromeInstance, ChromePoolManager
 
-
 # --- Fixtures ---
 
 
@@ -94,19 +93,72 @@ class TestChromeInstance:
 class TestChromePoolManagerPorts:
     """Tests for port allocation."""
 
+    def test_is_port_in_use_returns_true_when_responding(self) -> None:
+        """Should return True when port responds to HTTP request."""
+        manager = ChromePoolManager(port_min=9222, port_max=9225)
+
+        with patch("wsl_chrome_mcp.chrome_pool.CDPProxyClient") as mock_client_class:
+            mock_client = MagicMock()
+            mock_client._make_http_request.return_value = {"Browser": "Chrome"}
+            mock_client_class.return_value = mock_client
+
+            assert manager._is_port_in_use(9222) is True
+            mock_client._make_http_request.assert_called_once_with("/json/version")
+
+    def test_is_port_in_use_returns_false_when_not_responding(self) -> None:
+        """Should return False when port doesn't respond."""
+        manager = ChromePoolManager(port_min=9222, port_max=9225)
+
+        with patch("wsl_chrome_mcp.chrome_pool.CDPProxyClient") as mock_client_class:
+            mock_client = MagicMock()
+            mock_client._make_http_request.return_value = None
+            mock_client_class.return_value = mock_client
+
+            assert manager._is_port_in_use(9222) is False
+
+    def test_is_port_in_use_returns_false_on_exception(self) -> None:
+        """Should return False when request raises exception."""
+        manager = ChromePoolManager(port_min=9222, port_max=9225)
+
+        with patch("wsl_chrome_mcp.chrome_pool.CDPProxyClient") as mock_client_class:
+            mock_client = MagicMock()
+            mock_client._make_http_request.side_effect = Exception("Connection refused")
+            mock_client_class.return_value = mock_client
+
+            assert manager._is_port_in_use(9222) is False
+
     def test_allocate_port_returns_first_available(self) -> None:
         """Should return first port in range."""
         manager = ChromePoolManager(port_min=9222, port_max=9225)
-        port = manager._allocate_port()
-        assert port == 9222
+
+        with patch.object(manager, "_is_port_in_use", return_value=False):
+            port = manager._allocate_port()
+            assert port == 9222
 
     def test_allocate_port_skips_used_ports(self) -> None:
         """Should skip already used ports."""
         manager = ChromePoolManager(port_min=9222, port_max=9225)
         manager._used_ports.add(9222)
         manager._used_ports.add(9223)
-        port = manager._allocate_port()
-        assert port == 9224
+
+        with patch.object(manager, "_is_port_in_use", return_value=False):
+            port = manager._allocate_port()
+            assert port == 9224
+
+    def test_allocate_port_skips_externally_used_ports(self) -> None:
+        """Should skip ports that are externally in use (orphaned Chrome)."""
+        manager = ChromePoolManager(port_min=9222, port_max=9225)
+
+        # Mock: 9222 and 9223 are externally in use, 9224 is free
+        def mock_is_port_in_use(port: int) -> bool:
+            return port in (9222, 9223)
+
+        with patch.object(manager, "_is_port_in_use", side_effect=mock_is_port_in_use):
+            port = manager._allocate_port()
+            assert port == 9224
+            # Externally used ports should be added to _used_ports
+            assert 9222 in manager._used_ports
+            assert 9223 in manager._used_ports
 
     def test_allocate_port_raises_when_exhausted(self) -> None:
         """Should raise when no ports available."""

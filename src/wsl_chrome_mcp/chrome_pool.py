@@ -69,8 +69,32 @@ class ChromePoolManager:
         self._headless = headless
         self._chrome_path: str | None = None
 
+    def _is_port_in_use(self, port: int) -> bool:
+        """Check if a port is actually in use by attempting to connect.
+
+        This catches cases where a Chrome from a previous server run is still
+        running on a port that we think is available (because _used_ports is
+        in-memory only and gets cleared on restart).
+
+        Args:
+            port: The port to check.
+
+        Returns:
+            True if something is listening on the port, False otherwise.
+        """
+        proxy = CDPProxyClient(port)
+        try:
+            # If we get a response, something is already using this port
+            version = proxy._make_http_request("/json/version")
+            return version is not None
+        except Exception:
+            return False
+
     def _allocate_port(self) -> int:
         """Find next available port in range.
+
+        Checks both in-memory tracking and actual port availability to handle
+        cases where Chrome instances survive server restarts.
 
         Returns:
             An available port number.
@@ -79,10 +103,19 @@ class ChromePoolManager:
             RuntimeError: If no ports are available.
         """
         for port in range(self._port_min, self._port_max):
-            if port not in self._used_ports:
+            if port in self._used_ports:
+                continue
+            if self._is_port_in_use(port):
+                logger.warning(
+                    "Port %d is in use by external process (orphaned Chrome?), skipping",
+                    port,
+                )
+                # Add to used_ports so we don't check it again this session
                 self._used_ports.add(port)
-                logger.debug("Allocated port %d", port)
-                return port
+                continue
+            self._used_ports.add(port)
+            logger.debug("Allocated port %d", port)
+            return port
         raise RuntimeError(
             f"No available ports in range {self._port_min}-{self._port_max}. "
             f"Too many concurrent sessions ({len(self._used_ports)})."
