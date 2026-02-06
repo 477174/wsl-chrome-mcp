@@ -1,52 +1,147 @@
 """Chrome pool manager for per-session Chrome instances.
 
 Each opencode chat session gets its own Chrome process on a unique port,
-providing complete isolation between sessions.
+providing complete isolation between sessions. This version uses persistent
+WebSocket connections for real-time event handling.
 """
 
 from __future__ import annotations
 
 import asyncio
 import logging
+import os
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any
 
 from .cdp_proxy import CDPProxyClient
-from .wsl import run_windows_command
+from .persistent_cdp import PersistentCDPClient, enable_domains
+from .tunnel import SocatTunnel, TunnelManager
+from .wsl import is_wsl, run_windows_command
 
 logger = logging.getLogger(__name__)
 
 
 @dataclass
+class ConsoleMessage:
+    """A console message captured from the browser."""
+
+    type: str  # log, warn, error, info, debug
+    text: str
+    timestamp: float | None = None
+    stack_trace: list[dict[str, Any]] | None = None
+    args: list[Any] | None = None
+
+
+@dataclass
+class NetworkRequest:
+    """A network request captured from the browser."""
+
+    request_id: str
+    url: str
+    method: str
+    timestamp: float | None = None
+    type: str | None = None  # Document, XHR, Fetch, etc.
+    headers: dict[str, str] = field(default_factory=dict)
+    post_data: str | None = None
+    response: dict[str, Any] | None = None
+    response_body: bytes | None = None
+
+
+@dataclass
+class DialogInfo:
+    """Information about a pending browser dialog."""
+
+    type: str  # alert, confirm, prompt, beforeunload
+    message: str
+    default_prompt: str | None = None
+    url: str | None = None
+
+
+@dataclass
 class ChromeInstance:
-    """A Chrome instance dedicated to a single session."""
+    """A Chrome instance dedicated to a single session.
+
+    Maintains persistent CDP connection for real-time events.
+    """
 
     session_id: str
     port: int
     pid: int | None  # Windows PID for cleanup
-    proxy: CDPProxyClient
     user_data_dir: str  # Temp dir on Windows
     created_at: datetime
+
+    # Connection components
+    tunnel: SocatTunnel | None = None
+    cdp: PersistentCDPClient | None = None  # For current page
+    browser_cdp: PersistentCDPClient | None = None  # For browser-level commands
+    proxy: CDPProxyClient | None = None  # Fallback for one-shot commands
 
     # Tab tracking within this Chrome instance
     current_target_id: str | None = None
     targets: list[str] = field(default_factory=list)
-    ws_urls: dict[str, str] = field(default_factory=dict)  # target_id -> ws_url
+
+    # Event-collected data
+    console_messages: list[ConsoleMessage] = field(default_factory=list)
+    network_requests: dict[str, NetworkRequest] = field(default_factory=dict)
+    pending_dialog: DialogInfo | None = None
+
+    # Snapshot cache for accessibility tree
+    snapshot_cache: dict[str, dict[str, Any]] = field(default_factory=dict)
+    snapshot_node_ids: dict[str, int] = field(default_factory=dict)  # uid -> backendNodeId
+
+    # Performance trace state
+    trace_active: bool = False
+    trace_events: list[dict[str, Any]] = field(default_factory=list)
+
+    # Emulation state (persisted across navigations)
+    emulation_state: dict[str, Any] = field(default_factory=dict)
 
     @property
-    def current_ws_url(self) -> str | None:
-        """Get WebSocket URL for the current (active) tab."""
-        if self.current_target_id and self.current_target_id in self.ws_urls:
-            return self.ws_urls[self.current_target_id]
-        return None
+    def is_connected(self) -> bool:
+        """Check if CDP client is connected."""
+        return self.cdp is not None and self.cdp.is_connected
+
+    def clear_page_state(self) -> None:
+        """Clear state that should be reset on navigation."""
+        self.console_messages.clear()
+        self.network_requests.clear()
+        self.snapshot_cache.clear()
+        self.snapshot_node_ids.clear()
+
+    def add_console_message(
+        self,
+        msg_type: str,
+        text: str,
+        timestamp: float | None = None,
+        stack_trace: list[dict[str, Any]] | None = None,
+        args: list[Any] | None = None,
+    ) -> None:
+        """Add a console message to the collection."""
+        self.console_messages.append(
+            ConsoleMessage(
+                type=msg_type,
+                text=text,
+                timestamp=timestamp,
+                stack_trace=stack_trace,
+                args=args,
+            )
+        )
+
+    def add_network_request(self, request_id: str, request: NetworkRequest) -> None:
+        """Add or update a network request."""
+        self.network_requests[request_id] = request
+
+    def set_dialog(self, dialog: DialogInfo | None) -> None:
+        """Set or clear the pending dialog."""
+        self.pending_dialog = dialog
 
 
 class ChromePoolManager:
-    """Manages one Chrome instance per session.
+    """Manages one Chrome instance per session with persistent connections.
 
-    Each session gets its own Chrome process on a unique port.
-    This provides complete isolation - no window confusion, no race conditions.
+    Each session gets its own Chrome process on a unique port, with a
+    persistent WebSocket connection for real-time event handling.
     """
 
     def __init__(
@@ -68,40 +163,27 @@ class ChromePoolManager:
         self._used_ports: set[int] = set()
         self._headless = headless
         self._chrome_path: str | None = None
+        self._tunnel_manager = TunnelManager()
+
+        # Profile configuration from environment
+        self._profile_name: str | None = os.environ.get("CHROME_MCP_PROFILE") or None
+        if self._profile_name:
+            logger.info("Chrome profile configured: %s", self._profile_name)
+
+        # Clean up orphaned temp dirs from previous crashes
+        self._cleanup_orphaned_temp_dirs()
 
     def _is_port_in_use(self, port: int) -> bool:
-        """Check if a port is actually in use by attempting to connect.
-
-        This catches cases where a Chrome from a previous server run is still
-        running on a port that we think is available (because _used_ports is
-        in-memory only and gets cleared on restart).
-
-        Args:
-            port: The port to check.
-
-        Returns:
-            True if something is listening on the port, False otherwise.
-        """
+        """Check if a port is actually in use by attempting to connect."""
         proxy = CDPProxyClient(port)
         try:
-            # If we get a response, something is already using this port
             version = proxy._make_http_request("/json/version")
             return version is not None
         except Exception:
             return False
 
     def _allocate_port(self) -> int:
-        """Find next available port in range.
-
-        Checks both in-memory tracking and actual port availability to handle
-        cases where Chrome instances survive server restarts.
-
-        Returns:
-            An available port number.
-
-        Raises:
-            RuntimeError: If no ports are available.
-        """
+        """Find next available port in range."""
         for port in range(self._port_min, self._port_max):
             if port in self._used_ports:
                 continue
@@ -110,7 +192,6 @@ class ChromePoolManager:
                     "Port %d is in use by external process (orphaned Chrome?), skipping",
                     port,
                 )
-                # Add to used_ports so we don't check it again this session
                 self._used_ports.add(port)
                 continue
             self._used_ports.add(port)
@@ -125,6 +206,127 @@ class ChromePoolManager:
         """Return port to available pool."""
         self._used_ports.discard(port)
         logger.debug("Released port %d", port)
+
+    # --- Profile management ---
+
+    def _get_windows_chrome_user_data_dir(self) -> str | None:
+        """Get Chrome's default user data directory on Windows.
+
+        Returns:
+            Path like 'C:\\Users\\user\\AppData\\Local\\Google\\Chrome\\User Data'
+            or None if not found.
+        """
+        ps_cmd = (
+            "$p = Join-Path $env:LOCALAPPDATA "
+            "'Google\\Chrome\\User Data'; "
+            "if (Test-Path $p) { Write-Output $p }"
+        )
+        try:
+            result = run_windows_command(ps_cmd, timeout=10.0)
+            path = result.stdout.strip() if result.returncode == 0 else None
+            if path:
+                return path
+        except Exception as e:
+            logger.warning("Failed to get Chrome user data dir: %s", e)
+        return None
+
+    def _profile_exists(self, profile_name: str) -> bool:
+        """Check if a Chrome profile directory exists.
+
+        Args:
+            profile_name: Profile folder name (e.g., "Default", "Profile 1").
+
+        Returns:
+            True if the profile directory exists on the Windows filesystem.
+        """
+        chrome_user_data = self._get_windows_chrome_user_data_dir()
+        if not chrome_user_data:
+            return False
+
+        ps_cmd = (
+            f'$p = Join-Path "{chrome_user_data}" "{profile_name}"; '
+            "if (Test-Path $p) { Write-Output 'exists' }"
+        )
+        try:
+            result = run_windows_command(ps_cmd, timeout=10.0)
+            return result.returncode == 0 and "exists" in result.stdout
+        except Exception as e:
+            logger.warning("Failed to check profile existence: %s", e)
+            return False
+
+    def _copy_profile_to_temp(self, profile_name: str, temp_dir: str) -> bool:
+        """Copy a Chrome profile into the temp user-data-dir.
+
+        Copies the profile folder contents into temp_dir/Default/ so Chrome
+        uses it automatically without needing --profile-directory.
+
+        Args:
+            profile_name: Source profile folder name.
+            temp_dir: Destination temp user-data-dir.
+
+        Returns:
+            True if copy succeeded, False otherwise.
+        """
+        chrome_user_data = self._get_windows_chrome_user_data_dir()
+        if not chrome_user_data:
+            logger.warning("Chrome user data dir not found, skipping profile copy")
+            return False
+
+        # Copy profile contents to temp_dir/Default/
+        ps_cmd = (
+            f'$src = Join-Path "{chrome_user_data}" "{profile_name}"; '
+            f'$dst = Join-Path "{temp_dir}" "Default"; '
+            "New-Item -ItemType Directory -Path $dst -Force | Out-Null; "
+            "Copy-Item -Path (Join-Path $src '*') "
+            "-Destination $dst -Recurse -Force; "
+            "Write-Output 'done'"
+        )
+        try:
+            result = run_windows_command(ps_cmd, timeout=120.0)
+            if result.returncode == 0 and "done" in result.stdout:
+                logger.info(
+                    "Copied profile '%s' to %s",
+                    profile_name,
+                    temp_dir,
+                )
+                return True
+            logger.warning(
+                "Profile copy returned unexpected result: rc=%d, stdout=%s",
+                result.returncode,
+                result.stdout[:200],
+            )
+        except Exception as e:
+            logger.warning("Failed to copy profile '%s': %s", profile_name, e)
+        return False
+
+    def _cleanup_orphaned_temp_dirs(self) -> None:
+        """Remove orphaned chrome-mcp-* temp directories from previous crashes.
+
+        Only removes directories older than 24 hours to avoid deleting
+        active session data.
+        """
+        ps_cmd = (
+            "Get-ChildItem -Path $env:TEMP -Filter 'chrome-mcp-*' "
+            "-Directory -ErrorAction SilentlyContinue | "
+            "Where-Object { $_.CreationTime -lt (Get-Date).AddHours(-24) } | "
+            "ForEach-Object { "
+            "Remove-Item -Path $_.FullName -Recurse -Force "
+            "-ErrorAction SilentlyContinue; "
+            "Write-Output $_.Name "
+            "}"
+        )
+        try:
+            result = run_windows_command(ps_cmd, timeout=30.0)
+            if result.returncode == 0 and result.stdout.strip():
+                removed = [d for d in result.stdout.strip().split("\n") if d.strip()]
+                if removed:
+                    logger.info(
+                        "Cleaned up %d orphaned temp dir(s): %s",
+                        len(removed),
+                        ", ".join(removed),
+                    )
+        except Exception as e:
+            logger.warning("Failed to clean up orphaned temp dirs: %s", e)
 
     async def _find_chrome_path(self) -> str:
         """Find Chrome executable on Windows."""
@@ -149,8 +351,153 @@ class ChromePoolManager:
         logger.info("Found Chrome at: %s", chrome_path)
         return chrome_path
 
+    def _setup_event_handlers(self, instance: ChromeInstance) -> None:
+        """Set up CDP event handlers for an instance."""
+        if not instance.cdp:
+            return
+
+        # Console messages
+        def on_console(params: dict[str, Any]) -> None:
+            args = params.get("args", [])
+            text_parts = []
+            for arg in args:
+                if "value" in arg:
+                    text_parts.append(str(arg["value"]))
+                elif "description" in arg:
+                    text_parts.append(arg["description"])
+                elif "preview" in arg:
+                    # Object preview
+                    preview = arg["preview"]
+                    text_parts.append(preview.get("description", str(preview)))
+
+            instance.add_console_message(
+                msg_type=params.get("type", "log"),
+                text=" ".join(text_parts) if text_parts else "",
+                timestamp=params.get("timestamp"),
+                stack_trace=params.get("stackTrace", {}).get("callFrames"),
+                args=args,
+            )
+
+        instance.cdp.on("Runtime.consoleAPICalled", on_console)
+
+        # Network requests
+        def on_request_will_be_sent(params: dict[str, Any]) -> None:
+            request_id = params["requestId"]
+            request = params["request"]
+
+            instance.add_network_request(
+                request_id,
+                NetworkRequest(
+                    request_id=request_id,
+                    url=request["url"],
+                    method=request["method"],
+                    timestamp=params.get("timestamp"),
+                    type=params.get("type"),
+                    headers=request.get("headers", {}),
+                    post_data=request.get("postData"),
+                ),
+            )
+
+        def on_response_received(params: dict[str, Any]) -> None:
+            request_id = params["requestId"]
+            if request_id in instance.network_requests:
+                response = params["response"]
+                req = instance.network_requests[request_id]
+                req.response = {
+                    "status": response["status"],
+                    "statusText": response.get("statusText", ""),
+                    "headers": response.get("headers", {}),
+                    "mimeType": response.get("mimeType"),
+                }
+
+        instance.cdp.on("Network.requestWillBeSent", on_request_will_be_sent)
+        instance.cdp.on("Network.responseReceived", on_response_received)
+
+        # Dialogs
+        def on_dialog_opening(params: dict[str, Any]) -> None:
+            instance.set_dialog(
+                DialogInfo(
+                    type=params["type"],
+                    message=params["message"],
+                    default_prompt=params.get("defaultPrompt"),
+                    url=params.get("url"),
+                )
+            )
+            logger.info(
+                "Session %s: Dialog opened - type=%s, message=%s",
+                instance.session_id,
+                params["type"],
+                params["message"][:50],
+            )
+
+        def on_dialog_closed(params: dict[str, Any]) -> None:
+            instance.set_dialog(None)
+
+        instance.cdp.on("Page.javascriptDialogOpening", on_dialog_opening)
+        instance.cdp.on("Page.javascriptDialogClosed", on_dialog_closed)
+
+        # Navigation (clear page state)
+        def on_frame_navigated(params: dict[str, Any]) -> None:
+            frame = params.get("frame", {})
+            if frame.get("parentId") is None:
+                # Main frame navigation - clear page-specific state
+                instance.clear_page_state()
+                logger.debug("Session %s: Main frame navigated, cleared state", instance.session_id)
+
+        instance.cdp.on("Page.frameNavigated", on_frame_navigated)
+
+        # Trace events (for performance)
+        def on_trace_data_collected(params: dict[str, Any]) -> None:
+            if instance.trace_active:
+                instance.trace_events.extend(params.get("value", []))
+
+        def on_tracing_complete(params: dict[str, Any]) -> None:
+            instance.trace_active = False
+            logger.info("Session %s: Tracing complete", instance.session_id)
+
+        instance.cdp.on("Tracing.dataCollected", on_trace_data_collected)
+        instance.cdp.on("Tracing.tracingComplete", on_tracing_complete)
+
+    async def _connect_cdp(self, instance: ChromeInstance, target_id: str) -> None:
+        """Establish persistent CDP connection for a target.
+
+        Args:
+            instance: The Chrome instance.
+            target_id: Target ID to connect to.
+        """
+        if not instance.tunnel:
+            raise RuntimeError("Tunnel not established")
+
+        # Get target info to find WebSocket URL
+        if instance.proxy:
+            targets = await instance.proxy.list_targets()
+            target = next((t for t in targets if t.get("id") == target_id), None)
+            if not target:
+                raise RuntimeError(f"Target {target_id} not found")
+
+            # Rewrite WebSocket URL to use tunnel
+            original_ws_url = target.get("webSocketDebuggerUrl", "")
+            # Replace the host:port with localhost:tunnel_port
+            ws_path = (
+                original_ws_url.split("/devtools/")[-1] if "/devtools/" in original_ws_url else ""
+            )
+            tunnel_ws_url = f"ws://localhost:{instance.tunnel.local_port}/devtools/{ws_path}"
+
+            logger.debug("Connecting CDP via tunnel: %s", tunnel_ws_url)
+
+            instance.cdp = PersistentCDPClient(tunnel_ws_url)
+            await instance.cdp.connect()
+
+            # Enable CDP domains for event collection
+            await enable_domains(instance.cdp, ["Page", "Runtime", "Network", "DOM"])
+
+            # Set up event handlers
+            self._setup_event_handlers(instance)
+
+            logger.info("Session %s: CDP connected to target %s", instance.session_id, target_id)
+
     async def _launch_chrome(self, session_id: str, port: int) -> ChromeInstance:
-        """Launch a new Chrome instance on Windows.
+        """Launch a new Chrome instance on Windows with persistent connection.
 
         Args:
             session_id: The session this Chrome belongs to.
@@ -173,6 +520,21 @@ class ChromePoolManager:
 
         if not user_data_dir:
             raise RuntimeError("Failed to create temp directory on Windows")
+
+        # Copy Chrome profile if configured and exists
+        if self._profile_name:
+            if self._profile_exists(self._profile_name):
+                copied = self._copy_profile_to_temp(self._profile_name, user_data_dir)
+                if not copied:
+                    logger.warning(
+                        "Profile '%s' copy failed, using fresh temp dir",
+                        self._profile_name,
+                    )
+            else:
+                logger.warning(
+                    "Profile '%s' not found, using fresh temp dir",
+                    self._profile_name,
+                )
 
         logger.info(
             "Launching Chrome for session %s on port %d (user_data_dir=%s)",
@@ -210,8 +572,10 @@ class ChromePoolManager:
             except ValueError:
                 logger.warning("Could not parse Chrome PID: %s", result.stdout)
 
-        # Wait for Chrome to be ready
+        # Create proxy for initial setup and fallback
         proxy = CDPProxyClient(port)
+
+        # Wait for Chrome to be ready
         for _attempt in range(30):
             await asyncio.sleep(1)
             version = await proxy.get_version()
@@ -230,37 +594,68 @@ class ChromePoolManager:
         page_targets = [t for t in targets if t.get("type") == "page"]
 
         if not page_targets:
-            # Create a new page if none exists
             new_page = await proxy.new_page()
             if new_page:
                 initial_target_id = new_page.get("id")
-                initial_ws_url = new_page.get("webSocketDebuggerUrl")
             else:
                 raise RuntimeError("Failed to create initial page")
         else:
             initial_target_id = page_targets[0].get("id")
-            initial_ws_url = page_targets[0].get("webSocketDebuggerUrl")
 
-        return ChromeInstance(
+        # Set up tunnel for persistent connection (WSL only)
+        tunnel: SocatTunnel | None = None
+        if is_wsl():
+            tunnel = await self._tunnel_manager.get_or_create(port)
+            logger.info("Tunnel established: localhost:%d -> Windows:%d", tunnel.local_port, port)
+
+        # Create instance
+        instance = ChromeInstance(
             session_id=session_id,
             port=port,
             pid=pid,
-            proxy=proxy,
             user_data_dir=user_data_dir,
             created_at=datetime.now(),
+            tunnel=tunnel,
+            proxy=proxy,
             current_target_id=initial_target_id,
             targets=[initial_target_id] if initial_target_id else [],
-            ws_urls={initial_target_id: initial_ws_url}
-            if initial_target_id and initial_ws_url
-            else {},
         )
 
+        # Establish persistent CDP connection
+        if initial_target_id:
+            try:
+                await self._connect_cdp(instance, initial_target_id)
+            except Exception as e:
+                logger.warning(
+                    "Failed to establish persistent CDP connection, falling back to proxy: %s", e
+                )
+
+        return instance
+
+    async def _disconnect_cdp(self, instance: ChromeInstance) -> None:
+        """Disconnect CDP clients for an instance."""
+        if instance.cdp:
+            await instance.cdp.disconnect()
+            instance.cdp = None
+
+        if instance.browser_cdp:
+            await instance.browser_cdp.disconnect()
+            instance.browser_cdp = None
+
     async def _kill_chrome(self, instance: ChromeInstance) -> None:
-        """Kill Chrome process and cleanup temp directory.
+        """Kill Chrome process and cleanup resources.
 
         Args:
             instance: The Chrome instance to kill.
         """
+        # Disconnect CDP first
+        await self._disconnect_cdp(instance)
+
+        # Stop tunnel
+        if instance.tunnel:
+            await self._tunnel_manager.remove(instance.port)
+
+        # Kill Chrome process
         if instance.pid:
             logger.info(
                 "Killing Chrome PID %d for session %s",
@@ -282,11 +677,7 @@ class ChromePoolManager:
             try:
                 run_windows_command(cleanup_ps, timeout=10.0)
             except Exception as e:
-                logger.warning(
-                    "Error cleaning up %s: %s",
-                    instance.user_data_dir,
-                    e,
-                )
+                logger.warning("Error cleaning up %s: %s", instance.user_data_dir, e)
 
     async def get_or_create(self, session_id: str) -> ChromeInstance:
         """Get existing Chrome instance or create new one for this session.
@@ -298,8 +689,18 @@ class ChromePoolManager:
             ChromeInstance for the requested session.
         """
         if session_id in self._instances:
+            instance = self._instances[session_id]
             logger.debug("Returning existing Chrome for session %s", session_id)
-            return self._instances[session_id]
+
+            # Check if connection is still alive
+            if not instance.is_connected and instance.current_target_id:
+                logger.info("Reconnecting CDP for session %s", session_id)
+                try:
+                    await self._connect_cdp(instance, instance.current_target_id)
+                except Exception as e:
+                    logger.warning("Failed to reconnect CDP: %s", e)
+
+            return instance
 
         logger.info("Creating new Chrome instance for session %s", session_id)
         port = self._allocate_port()
@@ -335,6 +736,8 @@ class ChromePoolManager:
             except Exception as e:
                 logger.warning("Error destroying session %s: %s", session_id, e)
 
+        await self._tunnel_manager.cleanup_all()
+
     def list_sessions(self) -> dict[str, dict[str, Any]]:
         """List all active sessions.
 
@@ -350,6 +753,9 @@ class ChromePoolManager:
                 "tab_count": len(instance.targets),
                 "current_target_id": instance.current_target_id,
                 "created_at": instance.created_at.isoformat(),
+                "connected": instance.is_connected,
+                "console_count": len(instance.console_messages),
+                "network_count": len(instance.network_requests),
             }
         return result
 
@@ -357,9 +763,6 @@ class ChromePoolManager:
 
     async def create_tab(self, session_id: str, url: str = "about:blank") -> str:
         """Create a new tab in a session's Chrome.
-
-        Since each session has its own Chrome with one window,
-        Target.createTarget simply works - no window confusion!
 
         Args:
             session_id: The session to create the tab in.
@@ -373,6 +776,9 @@ class ChromePoolManager:
         """
         instance = self._instances[session_id]
 
+        if not instance.proxy:
+            raise RuntimeError("No proxy available for session")
+
         browser_ws = await instance.proxy.get_browser_ws_url()
         if not browser_ws:
             raise RuntimeError("Failed to get browser WebSocket URL")
@@ -384,33 +790,20 @@ class ChromePoolManager:
         )
         target_id = result["targetId"]
 
-        # Get WebSocket URL for the new tab
-        targets = await instance.proxy.list_targets()
-        target = next((t for t in targets if t.get("id") == target_id), None)
-
-        if not target:
-            raise RuntimeError(f"New target {target_id} not found in targets list")
-
-        ws_url = target.get("webSocketDebuggerUrl")
-        if not ws_url:
-            raise RuntimeError(f"No WebSocket URL for target {target_id}")
-
         instance.targets.append(target_id)
-        instance.ws_urls[target_id] = ws_url
-        instance.current_target_id = target_id
+
+        # Switch to new tab
+        await self.switch_tab(session_id, target_id)
 
         logger.info("Session %s: created tab %s -> %s", session_id, target_id, url)
         return target_id
 
-    async def switch_tab(self, session_id: str, target_id: str) -> str:
+    async def switch_tab(self, session_id: str, target_id: str) -> None:
         """Switch the active tab in a session's Chrome.
 
         Args:
             session_id: The session to switch tabs in.
             target_id: The target_id to switch to.
-
-        Returns:
-            WebSocket URL of the newly active tab.
 
         Raises:
             KeyError: If session not found.
@@ -424,26 +817,31 @@ class ChromePoolManager:
                 f"Available: {instance.targets}"
             )
 
-        # Activate the target
-        browser_ws = await instance.proxy.get_browser_ws_url()
-        if browser_ws:
-            await instance.proxy.send_cdp_command(
-                browser_ws,
-                "Target.activateTarget",
-                {"targetId": target_id},
-            )
+        # Disconnect from old tab
+        if instance.cdp:
+            await instance.cdp.disconnect()
+            instance.cdp = None
+
+        # Activate the target via proxy
+        if instance.proxy:
+            browser_ws = await instance.proxy.get_browser_ws_url()
+            if browser_ws:
+                await instance.proxy.send_cdp_command(
+                    browser_ws,
+                    "Target.activateTarget",
+                    {"targetId": target_id},
+                )
 
         instance.current_target_id = target_id
+        instance.clear_page_state()
 
-        # Ensure we have the WebSocket URL
-        if target_id not in instance.ws_urls:
-            targets = await instance.proxy.list_targets()
-            target = next((t for t in targets if t.get("id") == target_id), None)
-            if target:
-                instance.ws_urls[target_id] = target.get("webSocketDebuggerUrl", "")
+        # Connect to new tab
+        try:
+            await self._connect_cdp(instance, target_id)
+        except Exception as e:
+            logger.warning("Failed to connect CDP to new tab: %s", e)
 
         logger.info("Session %s: switched to tab %s", session_id, target_id)
-        return instance.ws_urls.get(target_id, "")
 
     async def close_tab(self, session_id: str, target_id: str) -> None:
         """Close a tab in a session's Chrome.
@@ -467,22 +865,31 @@ class ChromePoolManager:
                 "Use destroy() to close the entire session."
             )
 
-        # Close the target
-        await instance.proxy.close_page(target_id)
+        # If closing current tab, disconnect CDP first
+        if instance.current_target_id == target_id and instance.cdp:
+            await instance.cdp.disconnect()
+            instance.cdp = None
+
+        # Close the target via proxy
+        if instance.proxy:
+            await instance.proxy.close_page(target_id)
 
         # Update state
         instance.targets.remove(target_id)
-        if target_id in instance.ws_urls:
-            del instance.ws_urls[target_id]
 
         # Switch to another tab if we closed the current one
         if instance.current_target_id == target_id:
-            instance.current_target_id = instance.targets[0]
-            logger.info(
-                "Session %s: auto-switched to tab %s",
-                session_id,
-                instance.current_target_id,
-            )
+            new_target_id = instance.targets[0]
+            instance.current_target_id = new_target_id
+            instance.clear_page_state()
+
+            # Connect to new tab
+            try:
+                await self._connect_cdp(instance, new_target_id)
+            except Exception as e:
+                logger.warning("Failed to connect CDP to new tab: %s", e)
+
+            logger.info("Session %s: auto-switched to tab %s", session_id, new_target_id)
 
         logger.info("Session %s: closed tab %s", session_id, target_id)
 
@@ -499,6 +906,9 @@ class ChromePoolManager:
             KeyError: If session not found.
         """
         instance = self._instances[session_id]
+
+        if not instance.proxy:
+            return []
 
         all_targets = await instance.proxy.list_targets()
         session_targets = [t for t in all_targets if t.get("id") in instance.targets]
