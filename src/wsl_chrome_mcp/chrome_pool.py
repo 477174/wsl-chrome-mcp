@@ -9,7 +9,6 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import os
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any
@@ -70,8 +69,6 @@ class ChromeInstance:
     pid: int | None
     user_data_dir: str
     created_at: datetime = field(default_factory=datetime.now)
-    is_temp_user_data_dir: bool = True
-    is_attached: bool = False
 
     # Connection components
     forwarder: WindowsPortForwarder | None = None
@@ -167,12 +164,6 @@ class ChromePoolManager:
         self._chrome_path: str | None = None
         self._forwarder_manager = PortForwarderManager()
 
-        # Profile configuration from environment
-        self._profile_name: str | None = os.environ.get("CHROME_MCP_PROFILE") or None
-        if self._profile_name:
-            logger.info("Chrome profile configured: %s", self._profile_name)
-
-        # Clean up orphaned temp dirs from previous crashes
         self._cleanup_orphaned_temp_dirs()
 
     def _is_port_in_use(self, port: int) -> bool:
@@ -209,119 +200,6 @@ class ChromePoolManager:
         self._used_ports.discard(port)
         logger.debug("Released port %d", port)
 
-    # --- Profile management ---
-
-    def _get_windows_chrome_user_data_dir(self) -> str | None:
-        """Get Chrome's default user data directory on Windows.
-
-        Returns:
-            Path like 'C:\\Users\\user\\AppData\\Local\\Google\\Chrome\\User Data'
-            or None if not found.
-        """
-        ps_cmd = (
-            "$p = Join-Path $env:LOCALAPPDATA "
-            "'Google\\Chrome\\User Data'; "
-            "if (Test-Path $p) { Write-Output $p }"
-        )
-        try:
-            result = run_windows_command(ps_cmd, timeout=10.0)
-            path = result.stdout.strip() if result.returncode == 0 else None
-            if path:
-                return path
-        except Exception as e:
-            logger.warning("Failed to get Chrome user data dir: %s", e)
-        return None
-
-    def _profile_exists(self, profile_name: str) -> bool:
-        """Check if a Chrome profile directory exists.
-
-        Args:
-            profile_name: Profile folder name (e.g., "Default", "Profile 1").
-
-        Returns:
-            True if the profile directory exists on the Windows filesystem.
-        """
-        chrome_user_data = self._get_windows_chrome_user_data_dir()
-        if not chrome_user_data:
-            return False
-
-        ps_cmd = (
-            f'$p = Join-Path "{chrome_user_data}" "{profile_name}"; '
-            "if (Test-Path $p) { Write-Output 'exists' }"
-        )
-        try:
-            result = run_windows_command(ps_cmd, timeout=10.0)
-            return result.returncode == 0 and "exists" in result.stdout
-        except Exception as e:
-            logger.warning("Failed to check profile existence: %s", e)
-            return False
-
-    def _resolve_profile_name(self, name: str) -> str | None:
-        """Resolve a Chrome profile display name or folder name to the actual folder name.
-
-        Chrome stores profiles in folders like "Default", "Profile 1", "Profile 2",
-        while users see display names like "Personal", "Work", etc. This method
-        accepts either form and returns the folder name.
-
-        Args:
-            name: Profile display name (e.g., "debugger") or folder name
-                (e.g., "Default", "Profile 1").
-
-        Returns:
-            The profile folder name if found, None otherwise.
-        """
-        if self._profile_exists(name):
-            logger.info("Profile folder '%s' found directly", name)
-            return name
-
-        chrome_user_data = self._get_windows_chrome_user_data_dir()
-        if not chrome_user_data:
-            return None
-
-        # Sanitize to prevent PowerShell injection via single-quote escaping
-        safe_name = name.replace("'", "''")
-
-        ps_cmd = (
-            f'$ls = Get-Content (Join-Path "{chrome_user_data}" "Local State") '
-            "-Raw | ConvertFrom-Json; "
-            "$ls.profile.info_cache.PSObject.Properties | ForEach-Object { "
-            f"if ($_.Value.name -eq '{safe_name}') "
-            "{ Write-Output $_.Name } }"
-        )
-        try:
-            result = run_windows_command(ps_cmd, timeout=10.0)
-            if result.returncode == 0 and result.stdout.strip():
-                folder_name = result.stdout.strip().split("\n")[0].strip()
-                logger.info(
-                    "Resolved profile display name '%s' to folder '%s'",
-                    name,
-                    folder_name,
-                )
-                return folder_name
-        except Exception as e:
-            logger.warning("Failed to resolve profile name '%s': %s", name, e)
-
-        self._log_available_profiles(chrome_user_data)
-        return None
-
-    def _log_available_profiles(self, chrome_user_data: str) -> None:
-        """Log available Chrome profiles to help diagnose configuration issues."""
-        ps_cmd = (
-            f'$ls = Get-Content (Join-Path "{chrome_user_data}" "Local State") '
-            "-Raw | ConvertFrom-Json; "
-            "$ls.profile.info_cache.PSObject.Properties | ForEach-Object { "
-            "Write-Output ('{0} -> {1}' -f $_.Name, $_.Value.name) }"
-        )
-        try:
-            result = run_windows_command(ps_cmd, timeout=10.0)
-            if result.returncode == 0 and result.stdout.strip():
-                profiles = result.stdout.strip()
-                logger.info("Available Chrome profiles:\n%s", profiles)
-            else:
-                logger.warning("Could not read Chrome profiles from Local State")
-        except Exception as e:
-            logger.warning("Failed to list Chrome profiles: %s", e)
-
     def _cleanup_orphaned_temp_dirs(self) -> None:
         """Remove orphaned chrome-mcp-* temp directories from previous crashes.
 
@@ -350,104 +228,6 @@ class ChromePoolManager:
                     )
         except Exception as e:
             logger.warning("Failed to clean up orphaned temp dirs: %s", e)
-
-    def _detect_debuggable_chrome(self) -> int | None:
-        """Find a running Chrome instance with remote debugging enabled.
-
-        Returns:
-            The debug port if found, None otherwise.
-        """
-        debug_port = self._find_chrome_debug_port()
-        if debug_port:
-            logger.info("Found debuggable Chrome on port %d", debug_port)
-        return debug_port
-
-    def _find_chrome_debug_port(self) -> int | None:
-        """Probe common debug ports to find a running Chrome with remote debugging."""
-        ps_ports = " ".join(
-            str(p) for p in range(self._port_min, min(self._port_min + 3, self._port_max))
-        )
-        ps_cmd = (
-            f"foreach ($p in {ps_ports}) {{ "
-            "try { "
-            '$r = Invoke-WebRequest -Uri "http://localhost:$p/json/version" '
-            "-UseBasicParsing -TimeoutSec 2 -ErrorAction Stop; "
-            "Write-Output $p; exit 0 "
-            "} catch { } "
-            "}"
-        )
-        try:
-            result = run_windows_command(ps_cmd, timeout=15.0)
-            if result.returncode == 0 and result.stdout.strip():
-                return int(result.stdout.strip().split("\n")[0].strip())
-        except (ValueError, Exception):
-            pass
-        return None
-
-    async def _attach_to_existing_chrome(
-        self,
-        session_id: str,
-        allocated_port: int,
-        debug_port: int,
-        user_data_dir: str,
-    ) -> ChromeInstance:
-        """Attach to an already-running Chrome instead of launching a new one."""
-        logger.info(
-            "Attaching to existing Chrome on port %d for session %s",
-            debug_port,
-            session_id,
-        )
-
-        if debug_port != allocated_port:
-            self._release_port(allocated_port)
-            self._used_ports.add(debug_port)
-
-        proxy = CDPProxyClient(debug_port)
-        targets = await proxy.list_targets()
-        page_targets = [t for t in targets if t.get("type") == "page"]
-
-        if not page_targets:
-            new_page = await proxy.new_page()
-            if new_page:
-                initial_target_id = new_page.get("id")
-            else:
-                raise RuntimeError("Attached to Chrome but failed to create initial page")
-        else:
-            initial_target_id = page_targets[0].get("id")
-
-        forwarder: WindowsPortForwarder | None = None
-        if is_wsl():
-            try:
-                forwarder = await self._forwarder_manager.get_or_create(debug_port)
-            except Exception as e:
-                logger.warning("Forwarder setup failed for attached Chrome: %s", e)
-
-        instance = ChromeInstance(
-            session_id=session_id,
-            port=debug_port,
-            pid=None,
-            user_data_dir=user_data_dir,
-            is_temp_user_data_dir=False,
-            is_attached=True,
-            forwarder=forwarder,
-            proxy=proxy,
-            current_target_id=initial_target_id,
-            targets=[initial_target_id] if initial_target_id else [],
-        )
-
-        if initial_target_id and forwarder is not None:
-            try:
-                await self._connect_cdp(instance, initial_target_id)
-            except Exception as e:
-                logger.warning("Failed to connect CDP to existing Chrome: %s", e)
-
-        logger.info(
-            "Session %s: attached to existing Chrome (port=%d, connected=%s)",
-            session_id,
-            debug_port,
-            instance.is_connected,
-        )
-        return instance
 
     async def _find_chrome_path(self) -> str:
         """Find Chrome executable on Windows."""
@@ -651,63 +431,22 @@ class ChromePoolManager:
         """
         chrome_path = await self._find_chrome_path()
 
-        profile_dir_flag: str | None = None
-        is_temp = True
-        user_data_dir: str | None = None
-
-        if self._profile_name:
-            chrome_user_data = self._get_windows_chrome_user_data_dir()
-            if chrome_user_data:
-                user_data_dir = chrome_user_data
-                is_temp = False
-                if self._profile_name == "*":
-                    logger.info("Using real Chrome user-data-dir with profile selector")
-                else:
-                    resolved = self._resolve_profile_name(self._profile_name)
-                    if resolved:
-                        profile_dir_flag = resolved
-                        logger.info(
-                            "Using real Chrome user-data-dir with profile '%s' (folder: '%s')",
-                            self._profile_name,
-                            resolved,
-                        )
-                    else:
-                        logger.warning(
-                            "Profile '%s' not found, using real user-data-dir with profile selector",
-                            self._profile_name,
-                        )
-            else:
-                logger.warning("Chrome user-data-dir not found, falling back to temp dir")
-
-        if is_temp or not user_data_dir:
-            create_temp_ps = (
-                '$temp = Join-Path $env:TEMP ("chrome-mcp-" + '
-                "[System.IO.Path]::GetRandomFileName()); "
-                "New-Item -ItemType Directory -Path $temp -Force | Out-Null; "
-                "Write-Output $temp"
-            )
-            result = run_windows_command(create_temp_ps, timeout=10.0)
-            user_data_dir = result.stdout.strip() if result.returncode == 0 else None
-            if not user_data_dir:
-                raise RuntimeError("Failed to create temp directory on Windows")
-            is_temp = True
-
-        if not is_temp:
-            debug_port = self._detect_debuggable_chrome()
-            if debug_port:
-                return await self._attach_to_existing_chrome(
-                    session_id,
-                    port,
-                    debug_port,
-                    user_data_dir,
-                )
+        create_temp_ps = (
+            '$temp = Join-Path $env:TEMP ("chrome-mcp-" + '
+            "[System.IO.Path]::GetRandomFileName()); "
+            "New-Item -ItemType Directory -Path $temp -Force | Out-Null; "
+            "Write-Output $temp"
+        )
+        result = run_windows_command(create_temp_ps, timeout=10.0)
+        user_data_dir = result.stdout.strip() if result.returncode == 0 else None
+        if not user_data_dir:
+            raise RuntimeError("Failed to create temp directory on Windows")
 
         logger.info(
-            "Launching Chrome for session %s on port %d (user_data_dir=%s, temp=%s)",
+            "Launching Chrome for session %s on port %d (user_data_dir=%s)",
             session_id,
             port,
             user_data_dir,
-            is_temp,
         )
 
         args = [
@@ -717,8 +456,6 @@ class ChromePoolManager:
             "--no-first-run",
             "--no-default-browser-check",
         ]
-        if profile_dir_flag:
-            args.append(f"--profile-directory={profile_dir_flag}")
         if self._headless:
             args.append("--headless=new")
 
@@ -796,7 +533,6 @@ class ChromePoolManager:
             port=port,
             pid=pid,
             user_data_dir=user_data_dir,
-            is_temp_user_data_dir=is_temp,
             forwarder=forwarder,
             proxy=proxy,
             current_target_id=initial_target_id,
@@ -854,12 +590,7 @@ class ChromePoolManager:
         if instance.forwarder:
             await self._forwarder_manager.remove(instance.port)
 
-        if instance.is_attached:
-            logger.info(
-                "Session %s: detaching from Chrome (not killing — was not launched by us)",
-                instance.session_id,
-            )
-        elif instance.pid:
+        if instance.pid:
             logger.info(
                 "Killing Chrome PID %d for session %s",
                 instance.pid,
@@ -871,7 +602,7 @@ class ChromePoolManager:
             except Exception as e:
                 logger.warning("Error killing Chrome PID %d: %s", instance.pid, e)
 
-        if instance.user_data_dir and instance.is_temp_user_data_dir:
+        if instance.user_data_dir:
             cleanup_ps = (
                 f'Remove-Item -Path "{instance.user_data_dir}" '
                 "-Recurse -Force -ErrorAction SilentlyContinue"
