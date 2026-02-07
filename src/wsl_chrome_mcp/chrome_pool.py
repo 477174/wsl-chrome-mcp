@@ -351,67 +351,47 @@ class ChromePoolManager:
         except Exception as e:
             logger.warning("Failed to clean up orphaned temp dirs: %s", e)
 
-    def _detect_existing_chrome(self, user_data_dir: str) -> dict[str, Any] | None:
-        """Check if Chrome is already running with the given user-data-dir.
+    def _detect_debuggable_chrome(self) -> int | None:
+        """Find a running Chrome instance with remote debugging enabled.
 
         Returns:
-            Dict with 'pid' and 'debug_port' (int or None) if found, else None.
+            The debug port if found, None otherwise.
         """
-        ps_cmd = (
-            "Get-Process chrome -ErrorAction SilentlyContinue | "
-            "Select-Object -First 1 -Property Id | "
-            "ForEach-Object { Write-Output $_.Id }"
-        )
-        try:
-            result = run_windows_command(ps_cmd, timeout=10.0)
-            if result.returncode != 0 or not result.stdout.strip():
-                return None
-        except Exception:
-            return None
-
         debug_port = self._find_chrome_debug_port()
-        pid_str = result.stdout.strip().split("\n")[0].strip()
-        try:
-            pid = int(pid_str)
-        except ValueError:
-            return None
-
-        logger.info(
-            "Detected existing Chrome (PID %d, debug_port=%s)",
-            pid,
-            debug_port,
-        )
-        return {"pid": pid, "debug_port": debug_port}
+        if debug_port:
+            logger.info("Found debuggable Chrome on port %d", debug_port)
+        return debug_port
 
     def _find_chrome_debug_port(self) -> int | None:
         """Probe common debug ports to find a running Chrome with remote debugging."""
-        for port in range(self._port_min, min(self._port_min + 5, self._port_max)):
-            proxy = CDPProxyClient(port)
-            try:
-                version = proxy._make_http_request("/json/version")
-                if version:
-                    return port
-            except Exception:
-                continue
+        ps_ports = " ".join(
+            str(p) for p in range(self._port_min, min(self._port_min + 3, self._port_max))
+        )
+        ps_cmd = (
+            f"foreach ($p in {ps_ports}) {{ "
+            "try { "
+            '$r = Invoke-WebRequest -Uri "http://localhost:$p/json/version" '
+            "-UseBasicParsing -TimeoutSec 2 -ErrorAction Stop; "
+            "Write-Output $p; exit 0 "
+            "} catch { } "
+            "}"
+        )
+        try:
+            result = run_windows_command(ps_cmd, timeout=15.0)
+            if result.returncode == 0 and result.stdout.strip():
+                return int(result.stdout.strip().split("\n")[0].strip())
+        except (ValueError, Exception):
+            pass
         return None
 
     async def _attach_to_existing_chrome(
         self,
         session_id: str,
         allocated_port: int,
-        existing: dict[str, Any],
+        debug_port: int,
         user_data_dir: str,
     ) -> ChromeInstance:
         """Attach to an already-running Chrome instead of launching a new one."""
-        debug_port: int | None = existing.get("debug_port")
-
-        if not debug_port:
-            self._release_port(allocated_port)
-            raise RuntimeError(
-                "Chrome is already running with this profile but without remote debugging. "
-                "Close Chrome first, or start it with --remote-debugging-port=9222"
-            )
-
         logger.info(
             "Attaching to existing Chrome on port %d for session %s",
             debug_port,
@@ -445,7 +425,7 @@ class ChromePoolManager:
         instance = ChromeInstance(
             session_id=session_id,
             port=debug_port,
-            pid=existing.get("pid"),
+            pid=None,
             user_data_dir=user_data_dir,
             is_temp_user_data_dir=False,
             is_attached=True,
@@ -713,12 +693,12 @@ class ChromePoolManager:
             is_temp = True
 
         if not is_temp:
-            existing = self._detect_existing_chrome(user_data_dir)
-            if existing:
+            debug_port = self._detect_debuggable_chrome()
+            if debug_port:
                 return await self._attach_to_existing_chrome(
                     session_id,
                     port,
-                    existing,
+                    debug_port,
                     user_data_dir,
                 )
 
