@@ -16,7 +16,7 @@ from typing import Any
 
 from .cdp_proxy import CDPProxyClient
 from .persistent_cdp import PersistentCDPClient, enable_domains
-from .tunnel import SocatTunnel, TunnelManager
+from .tunnel import PortForwarderManager, WindowsPortForwarder
 from .wsl import is_wsl, run_windows_command
 
 logger = logging.getLogger(__name__)
@@ -67,12 +67,14 @@ class ChromeInstance:
 
     session_id: str
     port: int
-    pid: int | None  # Windows PID for cleanup
-    user_data_dir: str  # Temp dir on Windows
-    created_at: datetime
+    pid: int | None
+    user_data_dir: str
+    created_at: datetime = field(default_factory=datetime.now)
+    is_temp_user_data_dir: bool = True
+    is_attached: bool = False
 
     # Connection components
-    tunnel: SocatTunnel | None = None
+    forwarder: WindowsPortForwarder | None = None
     cdp: PersistentCDPClient | None = None  # For current page
     browser_cdp: PersistentCDPClient | None = None  # For browser-level commands
     proxy: CDPProxyClient | None = None  # Fallback for one-shot commands
@@ -163,7 +165,7 @@ class ChromePoolManager:
         self._used_ports: set[int] = set()
         self._headless = headless
         self._chrome_path: str | None = None
-        self._tunnel_manager = TunnelManager()
+        self._forwarder_manager = PortForwarderManager()
 
         # Profile configuration from environment
         self._profile_name: str | None = os.environ.get("CHROME_MCP_PROFILE") or None
@@ -254,50 +256,71 @@ class ChromePoolManager:
             logger.warning("Failed to check profile existence: %s", e)
             return False
 
-    def _copy_profile_to_temp(self, profile_name: str, temp_dir: str) -> bool:
-        """Copy a Chrome profile into the temp user-data-dir.
+    def _resolve_profile_name(self, name: str) -> str | None:
+        """Resolve a Chrome profile display name or folder name to the actual folder name.
 
-        Copies the profile folder contents into temp_dir/Default/ so Chrome
-        uses it automatically without needing --profile-directory.
+        Chrome stores profiles in folders like "Default", "Profile 1", "Profile 2",
+        while users see display names like "Personal", "Work", etc. This method
+        accepts either form and returns the folder name.
 
         Args:
-            profile_name: Source profile folder name.
-            temp_dir: Destination temp user-data-dir.
+            name: Profile display name (e.g., "debugger") or folder name
+                (e.g., "Default", "Profile 1").
 
         Returns:
-            True if copy succeeded, False otherwise.
+            The profile folder name if found, None otherwise.
         """
+        if self._profile_exists(name):
+            logger.info("Profile folder '%s' found directly", name)
+            return name
+
         chrome_user_data = self._get_windows_chrome_user_data_dir()
         if not chrome_user_data:
-            logger.warning("Chrome user data dir not found, skipping profile copy")
-            return False
+            return None
 
-        # Copy profile contents to temp_dir/Default/
+        # Sanitize to prevent PowerShell injection via single-quote escaping
+        safe_name = name.replace("'", "''")
+
         ps_cmd = (
-            f'$src = Join-Path "{chrome_user_data}" "{profile_name}"; '
-            f'$dst = Join-Path "{temp_dir}" "Default"; '
-            "New-Item -ItemType Directory -Path $dst -Force | Out-Null; "
-            "Copy-Item -Path (Join-Path $src '*') "
-            "-Destination $dst -Recurse -Force; "
-            "Write-Output 'done'"
+            f'$ls = Get-Content (Join-Path "{chrome_user_data}" "Local State") '
+            "-Raw | ConvertFrom-Json; "
+            "$ls.profile.info_cache.PSObject.Properties | ForEach-Object { "
+            f"if ($_.Value.name -eq '{safe_name}') "
+            "{ Write-Output $_.Name } }"
         )
         try:
-            result = run_windows_command(ps_cmd, timeout=120.0)
-            if result.returncode == 0 and "done" in result.stdout:
+            result = run_windows_command(ps_cmd, timeout=10.0)
+            if result.returncode == 0 and result.stdout.strip():
+                folder_name = result.stdout.strip().split("\n")[0].strip()
                 logger.info(
-                    "Copied profile '%s' to %s",
-                    profile_name,
-                    temp_dir,
+                    "Resolved profile display name '%s' to folder '%s'",
+                    name,
+                    folder_name,
                 )
-                return True
-            logger.warning(
-                "Profile copy returned unexpected result: rc=%d, stdout=%s",
-                result.returncode,
-                result.stdout[:200],
-            )
+                return folder_name
         except Exception as e:
-            logger.warning("Failed to copy profile '%s': %s", profile_name, e)
-        return False
+            logger.warning("Failed to resolve profile name '%s': %s", name, e)
+
+        self._log_available_profiles(chrome_user_data)
+        return None
+
+    def _log_available_profiles(self, chrome_user_data: str) -> None:
+        """Log available Chrome profiles to help diagnose configuration issues."""
+        ps_cmd = (
+            f'$ls = Get-Content (Join-Path "{chrome_user_data}" "Local State") '
+            "-Raw | ConvertFrom-Json; "
+            "$ls.profile.info_cache.PSObject.Properties | ForEach-Object { "
+            "Write-Output ('{0} -> {1}' -f $_.Name, $_.Value.name) }"
+        )
+        try:
+            result = run_windows_command(ps_cmd, timeout=10.0)
+            if result.returncode == 0 and result.stdout.strip():
+                profiles = result.stdout.strip()
+                logger.info("Available Chrome profiles:\n%s", profiles)
+            else:
+                logger.warning("Could not read Chrome profiles from Local State")
+        except Exception as e:
+            logger.warning("Failed to list Chrome profiles: %s", e)
 
     def _cleanup_orphaned_temp_dirs(self) -> None:
         """Remove orphaned chrome-mcp-* temp directories from previous crashes.
@@ -327,6 +350,124 @@ class ChromePoolManager:
                     )
         except Exception as e:
             logger.warning("Failed to clean up orphaned temp dirs: %s", e)
+
+    def _detect_existing_chrome(self, user_data_dir: str) -> dict[str, Any] | None:
+        """Check if Chrome is already running with the given user-data-dir.
+
+        Returns:
+            Dict with 'pid' and 'debug_port' (int or None) if found, else None.
+        """
+        ps_cmd = (
+            "Get-Process chrome -ErrorAction SilentlyContinue | "
+            "Select-Object -First 1 -Property Id | "
+            "ForEach-Object { Write-Output $_.Id }"
+        )
+        try:
+            result = run_windows_command(ps_cmd, timeout=10.0)
+            if result.returncode != 0 or not result.stdout.strip():
+                return None
+        except Exception:
+            return None
+
+        debug_port = self._find_chrome_debug_port()
+        pid_str = result.stdout.strip().split("\n")[0].strip()
+        try:
+            pid = int(pid_str)
+        except ValueError:
+            return None
+
+        logger.info(
+            "Detected existing Chrome (PID %d, debug_port=%s)",
+            pid,
+            debug_port,
+        )
+        return {"pid": pid, "debug_port": debug_port}
+
+    def _find_chrome_debug_port(self) -> int | None:
+        """Probe common debug ports to find a running Chrome with remote debugging."""
+        for port in range(self._port_min, min(self._port_min + 5, self._port_max)):
+            proxy = CDPProxyClient(port)
+            try:
+                version = proxy._make_http_request("/json/version")
+                if version:
+                    return port
+            except Exception:
+                continue
+        return None
+
+    async def _attach_to_existing_chrome(
+        self,
+        session_id: str,
+        allocated_port: int,
+        existing: dict[str, Any],
+        user_data_dir: str,
+    ) -> ChromeInstance:
+        """Attach to an already-running Chrome instead of launching a new one."""
+        debug_port: int | None = existing.get("debug_port")
+
+        if not debug_port:
+            self._release_port(allocated_port)
+            raise RuntimeError(
+                "Chrome is already running with this profile but without remote debugging. "
+                "Close Chrome first, or start it with --remote-debugging-port=9222"
+            )
+
+        logger.info(
+            "Attaching to existing Chrome on port %d for session %s",
+            debug_port,
+            session_id,
+        )
+
+        if debug_port != allocated_port:
+            self._release_port(allocated_port)
+            self._used_ports.add(debug_port)
+
+        proxy = CDPProxyClient(debug_port)
+        targets = await proxy.list_targets()
+        page_targets = [t for t in targets if t.get("type") == "page"]
+
+        if not page_targets:
+            new_page = await proxy.new_page()
+            if new_page:
+                initial_target_id = new_page.get("id")
+            else:
+                raise RuntimeError("Attached to Chrome but failed to create initial page")
+        else:
+            initial_target_id = page_targets[0].get("id")
+
+        forwarder: WindowsPortForwarder | None = None
+        if is_wsl():
+            try:
+                forwarder = await self._forwarder_manager.get_or_create(debug_port)
+            except Exception as e:
+                logger.warning("Forwarder setup failed for attached Chrome: %s", e)
+
+        instance = ChromeInstance(
+            session_id=session_id,
+            port=debug_port,
+            pid=existing.get("pid"),
+            user_data_dir=user_data_dir,
+            is_temp_user_data_dir=False,
+            is_attached=True,
+            forwarder=forwarder,
+            proxy=proxy,
+            current_target_id=initial_target_id,
+            targets=[initial_target_id] if initial_target_id else [],
+        )
+
+        if initial_target_id and forwarder is not None:
+            try:
+                await self._connect_cdp(instance, initial_target_id)
+            except Exception as e:
+                logger.warning("Failed to connect CDP to existing Chrome: %s", e)
+
+        logger.info(
+            "Session %s: attached to existing Chrome (port=%d, connected=%s)",
+            session_id,
+            debug_port,
+            instance.is_connected,
+        )
+        return instance
 
     async def _find_chrome_path(self) -> str:
         """Find Chrome executable on Windows."""
@@ -461,40 +602,62 @@ class ChromePoolManager:
     async def _connect_cdp(self, instance: ChromeInstance, target_id: str) -> None:
         """Establish persistent CDP connection for a target.
 
+        Requires either a working tunnel (WSL) or direct access (non-WSL).
+
         Args:
             instance: The Chrome instance.
             target_id: Target ID to connect to.
+
+        Raises:
+            RuntimeError: If no connection method is available.
+            ConnectionError: If WebSocket connection fails.
         """
-        if not instance.tunnel:
-            raise RuntimeError("Tunnel not established")
-
         # Get target info to find WebSocket URL
-        if instance.proxy:
-            targets = await instance.proxy.list_targets()
-            target = next((t for t in targets if t.get("id") == target_id), None)
-            if not target:
-                raise RuntimeError(f"Target {target_id} not found")
+        if not instance.proxy:
+            raise RuntimeError("No proxy available to discover targets")
 
-            # Rewrite WebSocket URL to use tunnel
-            original_ws_url = target.get("webSocketDebuggerUrl", "")
-            # Replace the host:port with localhost:tunnel_port
+        targets = await instance.proxy.list_targets()
+        target = next((t for t in targets if t.get("id") == target_id), None)
+        if not target:
+            raise RuntimeError(f"Target {target_id} not found")
+
+        original_ws_url = target.get("webSocketDebuggerUrl", "")
+        if not original_ws_url:
+            raise RuntimeError(f"No WebSocket URL for target {target_id}")
+
+        # Build the WebSocket URL:
+        # - With forwarder (WSL): use forwarder's host:port
+        # - Without forwarder (non-WSL): use the original URL directly
+        if instance.forwarder:
             ws_path = (
                 original_ws_url.split("/devtools/")[-1] if "/devtools/" in original_ws_url else ""
             )
-            tunnel_ws_url = f"ws://localhost:{instance.tunnel.local_port}/devtools/{ws_path}"
+            ws_url = instance.forwarder.get_ws_url(f"/devtools/{ws_path}")
+            logger.debug("Connecting CDP via forwarder: %s", ws_url)
+        elif not is_wsl():
+            ws_url = original_ws_url
+            logger.debug("Connecting CDP directly: %s", ws_url)
+        else:
+            raise RuntimeError("Cannot establish persistent CDP in WSL without forwarder")
 
-            logger.debug("Connecting CDP via tunnel: %s", tunnel_ws_url)
+        # Disconnect previous CDP client if any
+        if instance.cdp and instance.cdp.is_connected:
+            await instance.cdp.disconnect()
 
-            instance.cdp = PersistentCDPClient(tunnel_ws_url)
-            await instance.cdp.connect()
+        instance.cdp = PersistentCDPClient(ws_url)
+        await instance.cdp.connect()
 
-            # Enable CDP domains for event collection
-            await enable_domains(instance.cdp, ["Page", "Runtime", "Network", "DOM"])
+        # Enable CDP domains for event collection
+        await enable_domains(instance.cdp, ["Page", "Runtime", "Network", "DOM"])
 
-            # Set up event handlers
-            self._setup_event_handlers(instance)
+        # Set up event handlers
+        self._setup_event_handlers(instance)
 
-            logger.info("Session %s: CDP connected to target %s", instance.session_id, target_id)
+        logger.info(
+            "Session %s: CDP connected to target %s",
+            instance.session_id,
+            target_id,
+        )
 
     async def _launch_chrome(self, session_id: str, port: int) -> ChromeInstance:
         """Launch a new Chrome instance on Windows with persistent connection.
@@ -508,42 +671,65 @@ class ChromePoolManager:
         """
         chrome_path = await self._find_chrome_path()
 
-        # Create temp directory on Windows
-        create_temp_ps = (
-            '$temp = Join-Path $env:TEMP ("chrome-mcp-" + '
-            "[System.IO.Path]::GetRandomFileName()); "
-            "New-Item -ItemType Directory -Path $temp -Force | Out-Null; "
-            "Write-Output $temp"
-        )
-        result = run_windows_command(create_temp_ps, timeout=10.0)
-        user_data_dir = result.stdout.strip() if result.returncode == 0 else None
+        profile_dir_flag: str | None = None
+        is_temp = True
+        user_data_dir: str | None = None
 
-        if not user_data_dir:
-            raise RuntimeError("Failed to create temp directory on Windows")
-
-        # Copy Chrome profile if configured and exists
         if self._profile_name:
-            if self._profile_exists(self._profile_name):
-                copied = self._copy_profile_to_temp(self._profile_name, user_data_dir)
-                if not copied:
-                    logger.warning(
-                        "Profile '%s' copy failed, using fresh temp dir",
-                        self._profile_name,
-                    )
+            chrome_user_data = self._get_windows_chrome_user_data_dir()
+            if chrome_user_data:
+                user_data_dir = chrome_user_data
+                is_temp = False
+                if self._profile_name == "*":
+                    logger.info("Using real Chrome user-data-dir with profile selector")
+                else:
+                    resolved = self._resolve_profile_name(self._profile_name)
+                    if resolved:
+                        profile_dir_flag = resolved
+                        logger.info(
+                            "Using real Chrome user-data-dir with profile '%s' (folder: '%s')",
+                            self._profile_name,
+                            resolved,
+                        )
+                    else:
+                        logger.warning(
+                            "Profile '%s' not found, using real user-data-dir with profile selector",
+                            self._profile_name,
+                        )
             else:
-                logger.warning(
-                    "Profile '%s' not found, using fresh temp dir",
-                    self._profile_name,
+                logger.warning("Chrome user-data-dir not found, falling back to temp dir")
+
+        if is_temp or not user_data_dir:
+            create_temp_ps = (
+                '$temp = Join-Path $env:TEMP ("chrome-mcp-" + '
+                "[System.IO.Path]::GetRandomFileName()); "
+                "New-Item -ItemType Directory -Path $temp -Force | Out-Null; "
+                "Write-Output $temp"
+            )
+            result = run_windows_command(create_temp_ps, timeout=10.0)
+            user_data_dir = result.stdout.strip() if result.returncode == 0 else None
+            if not user_data_dir:
+                raise RuntimeError("Failed to create temp directory on Windows")
+            is_temp = True
+
+        if not is_temp:
+            existing = self._detect_existing_chrome(user_data_dir)
+            if existing:
+                return await self._attach_to_existing_chrome(
+                    session_id,
+                    port,
+                    existing,
+                    user_data_dir,
                 )
 
         logger.info(
-            "Launching Chrome for session %s on port %d (user_data_dir=%s)",
+            "Launching Chrome for session %s on port %d (user_data_dir=%s, temp=%s)",
             session_id,
             port,
             user_data_dir,
+            is_temp,
         )
 
-        # Build Chrome arguments
         args = [
             f"--remote-debugging-port={port}",
             "--remote-debugging-address=0.0.0.0",
@@ -551,6 +737,8 @@ class ChromePoolManager:
             "--no-first-run",
             "--no-default-browser-check",
         ]
+        if profile_dir_flag:
+            args.append(f"--profile-directory={profile_dir_flag}")
         if self._headless:
             args.append("--headless=new")
 
@@ -602,33 +790,64 @@ class ChromePoolManager:
         else:
             initial_target_id = page_targets[0].get("id")
 
-        # Set up tunnel for persistent connection (WSL only)
-        tunnel: SocatTunnel | None = None
+        # Set up port forwarder for persistent connection (WSL only)
+        # Forwarder failure is non-fatal: we fall back to proxy-only mode
+        forwarder: WindowsPortForwarder | None = None
         if is_wsl():
-            tunnel = await self._tunnel_manager.get_or_create(port)
-            logger.info("Tunnel established: localhost:%d -> Windows:%d", tunnel.local_port, port)
+            try:
+                forwarder = await self._forwarder_manager.get_or_create(port)
+                logger.info(
+                    "Forwarder established: %s:%d -> 127.0.0.1:%d",
+                    forwarder.windows_host,
+                    forwarder.listen_port,
+                    port,
+                )
+            except Exception as e:
+                logger.warning(
+                    "Forwarder setup failed for port %d, using proxy-only mode: %s",
+                    port,
+                    e,
+                )
+                forwarder = None
 
-        # Create instance
+        assert user_data_dir is not None
         instance = ChromeInstance(
             session_id=session_id,
             port=port,
             pid=pid,
             user_data_dir=user_data_dir,
-            created_at=datetime.now(),
-            tunnel=tunnel,
+            is_temp_user_data_dir=is_temp,
+            forwarder=forwarder,
             proxy=proxy,
             current_target_id=initial_target_id,
             targets=[initial_target_id] if initial_target_id else [],
         )
 
-        # Establish persistent CDP connection
-        if initial_target_id:
+        # Establish persistent CDP connection (requires working forwarder in WSL)
+        if initial_target_id and forwarder is not None:
             try:
                 await self._connect_cdp(instance, initial_target_id)
             except Exception as e:
                 logger.warning(
-                    "Failed to establish persistent CDP connection, falling back to proxy: %s", e
+                    "Failed to establish persistent CDP connection, falling back to proxy: %s",
+                    e,
                 )
+
+        if instance.is_connected:
+            logger.info(
+                "Session %s: persistent CDP connection established",
+                session_id,
+            )
+        elif instance.proxy:
+            logger.info(
+                "Session %s: using proxy-only mode (no persistent CDP)",
+                session_id,
+            )
+        else:
+            logger.error(
+                "Session %s: no connection method available",
+                session_id,
+            )
 
         return instance
 
@@ -651,12 +870,16 @@ class ChromePoolManager:
         # Disconnect CDP first
         await self._disconnect_cdp(instance)
 
-        # Stop tunnel
-        if instance.tunnel:
-            await self._tunnel_manager.remove(instance.port)
+        # Stop forwarder
+        if instance.forwarder:
+            await self._forwarder_manager.remove(instance.port)
 
-        # Kill Chrome process
-        if instance.pid:
+        if instance.is_attached:
+            logger.info(
+                "Session %s: detaching from Chrome (not killing — was not launched by us)",
+                instance.session_id,
+            )
+        elif instance.pid:
             logger.info(
                 "Killing Chrome PID %d for session %s",
                 instance.pid,
@@ -668,8 +891,7 @@ class ChromePoolManager:
             except Exception as e:
                 logger.warning("Error killing Chrome PID %d: %s", instance.pid, e)
 
-        # Cleanup temp directory
-        if instance.user_data_dir:
+        if instance.user_data_dir and instance.is_temp_user_data_dir:
             cleanup_ps = (
                 f'Remove-Item -Path "{instance.user_data_dir}" '
                 "-Recurse -Force -ErrorAction SilentlyContinue"
@@ -692,11 +914,36 @@ class ChromePoolManager:
             instance = self._instances[session_id]
             logger.debug("Returning existing Chrome for session %s", session_id)
 
-            # Check if connection is still alive
+            # Check if persistent CDP connection is still alive
             if not instance.is_connected and instance.current_target_id:
                 logger.info("Reconnecting CDP for session %s", session_id)
                 try:
-                    await self._connect_cdp(instance, instance.current_target_id)
+                    # If forwarder exists but seems broken, recreate it
+                    if instance.forwarder and not instance.forwarder.is_running:
+                        logger.info(
+                            "Forwarder died for session %s, recreating",
+                            session_id,
+                        )
+                        try:
+                            instance.forwarder = await self._forwarder_manager.get_or_create(
+                                instance.port, verify=True
+                            )
+                        except Exception as te:
+                            logger.warning(
+                                "Forwarder recreation failed for session %s: %s",
+                                session_id,
+                                te,
+                            )
+                            instance.forwarder = None
+
+                    # Only attempt CDP reconnect if we have a forwarder (WSL) or not in WSL
+                    if instance.forwarder or not is_wsl():
+                        await self._connect_cdp(instance, instance.current_target_id)
+                    else:
+                        logger.debug(
+                            "Skipping CDP reconnect for session %s (no forwarder, proxy-only)",
+                            session_id,
+                        )
                 except Exception as e:
                     logger.warning("Failed to reconnect CDP: %s", e)
 
@@ -736,7 +983,7 @@ class ChromePoolManager:
             except Exception as e:
                 logger.warning("Error destroying session %s: %s", session_id, e)
 
-        await self._tunnel_manager.cleanup_all()
+        await self._forwarder_manager.cleanup_all()
 
     def list_sessions(self) -> dict[str, dict[str, Any]]:
         """List all active sessions.

@@ -256,7 +256,7 @@ class TestChromePoolManagerSessions:
 
         with (
             patch.object(manager, "_kill_chrome", new_callable=AsyncMock),
-            patch.object(manager._tunnel_manager, "cleanup_all", new_callable=AsyncMock),
+            patch.object(manager._forwarder_manager, "cleanup_all", new_callable=AsyncMock),
         ):
             await manager.cleanup_all()
 

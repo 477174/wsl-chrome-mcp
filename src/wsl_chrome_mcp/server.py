@@ -1,13 +1,15 @@
 """WSL Chrome MCP Server - Chrome DevTools for coding agents in WSL.
 
-Each session gets its own Chrome instance for complete isolation.
+Each session gets its own Chrome instance for complete isolation,
+with persistent WebSocket connections for real-time event handling.
+
+Tool naming follows ChromeDevTools conventions (navigate_page, click, fill, etc.)
+with backwards-compatible aliases for old names (chrome_navigate, chrome_click, etc.)
 """
 
 from __future__ import annotations
 
 import asyncio
-import base64
-import json
 import logging
 from collections.abc import Sequence
 from typing import Any
@@ -20,19 +22,16 @@ from mcp.types import (
     TextContent,
     Tool,
 )
-from pydantic import AnyUrl
 
-from .cdp_proxy import CDPProxyClient
 from .chrome_pool import ChromeInstance, ChromePoolManager
 from .logging_config import setup_logging
+from .tools import get_all_tools, get_tool
+from .tools.base import ContentResult
 from .wsl import get_windows_host_ip, is_wsl
 
 # Configure logging
 setup_logging()
 logger = logging.getLogger("wsl-chrome-mcp")
-
-# Type alias for tool return values
-ContentResult = Sequence[TextContent | ImageContent | EmbeddedResource]
 
 # session_id property shared across all tool schemas
 SESSION_ID_PROPERTY = {
@@ -44,17 +43,116 @@ SESSION_ID_PROPERTY = {
     },
 }
 
+# Map old tool names to new names for backwards compatibility
+TOOL_ALIASES = {
+    "chrome_navigate": "navigate_page",
+    "chrome_screenshot": "take_screenshot",
+    "chrome_click": "click",
+    "chrome_type": "fill",
+    "chrome_get_html": "get_html",
+    "chrome_evaluate": "evaluate",
+    "chrome_console": "get_console",
+    "chrome_network": "get_network",
+    "chrome_wait": "wait_for",
+    "chrome_scroll": "scroll",
+    "chrome_tabs": "list_pages",
+    "chrome_new_tab": "new_page",
+    "chrome_close_tab": "close_page",
+    "chrome_switch_tab": "select_page",
+    "chrome_pdf": "generate_pdf",
+}
 
-def _with_session_id(properties: dict[str, Any]) -> dict[str, Any]:
-    """Add session_id property to a tool's properties dict."""
-    return {**properties, **SESSION_ID_PROPERTY}
+# Tools that need special session handling (destroy needs to happen
+# at server level, not inside tool handler)
+SESSION_DESTROY_TOOL = "chrome_session_end"
+
+
+class ToolContextImpl:
+    """Implementation of ToolContext for tool handlers.
+
+    Provides access to Chrome instance and pool manager,
+    plus CDP and JS evaluation helpers.
+    """
+
+    def __init__(
+        self,
+        instance: ChromeInstance,
+        pool: ChromePoolManager,
+    ) -> None:
+        self._instance = instance
+        self._pool = pool
+
+    @property
+    def instance(self) -> ChromeInstance:
+        """Current Chrome instance."""
+        return self._instance
+
+    @property
+    def pool(self) -> ChromePoolManager:
+        """Chrome pool manager."""
+        return self._pool
+
+    async def send_cdp(self, method: str, params: dict[str, Any] | None = None) -> dict[str, Any]:
+        """Send a CDP command using persistent connection or proxy fallback."""
+        if self._instance.cdp and self._instance.is_connected:
+            return await self._instance.cdp.send(method, params)
+
+        if not self._instance.proxy:
+            raise RuntimeError("No CDP connection available (no proxy)")
+
+        all_targets = await self._instance.proxy.list_targets()
+        page_targets = [t for t in all_targets if t.get("type") == "page"]
+
+        exact_match = next(
+            (t for t in page_targets if t.get("id") == self._instance.current_target_id),
+            None,
+        )
+
+        if not exact_match and page_targets:
+            exact_match = page_targets[0]
+            old_id = self._instance.current_target_id
+            self._instance.current_target_id = exact_match.get("id")
+            self._instance.targets = [str(t["id"]) for t in page_targets if t.get("id")]
+            logger.warning(
+                "Target %s not found, falling back to %s (%s)",
+                old_id,
+                exact_match.get("id"),
+                exact_match.get("url", "unknown"),
+            )
+        target = exact_match
+
+        if not target:
+            raise RuntimeError(
+                f"No page targets available (found {len(all_targets)} non-page targets)"
+            )
+
+        ws_url = target.get("webSocketDebuggerUrl", "")
+        if not ws_url:
+            raise RuntimeError(f"Target {target.get('id')} has no webSocketDebuggerUrl")
+
+        return await self._instance.proxy.send_cdp_command(ws_url, method, params)
+
+    async def evaluate_js(self, expression: str) -> Any:
+        """Evaluate JavaScript in the page context."""
+        result = await self.send_cdp(
+            "Runtime.evaluate",
+            {
+                "expression": expression,
+                "returnByValue": True,
+                "awaitPromise": True,
+            },
+        )
+        if "exceptionDetails" in result:
+            raise RuntimeError(f"JS error: {result['exceptionDetails']}")
+        return result.get("result", {}).get("value")
 
 
 class ChromeMCPServer:
     """MCP Server providing Chrome DevTools capabilities.
 
-    Each opencode chat session gets its own Chrome instance on a unique port.
-    This provides complete isolation - no window confusion, no race conditions.
+    Each opencode chat session gets its own Chrome instance on a unique port,
+    with persistent WebSocket connections for real-time event handling.
+    All tools are registered in the modular tools/ package.
     """
 
     def __init__(self) -> None:
@@ -69,307 +167,7 @@ class ChromeMCPServer:
         @self.server.list_tools()
         async def list_tools() -> list[Tool]:
             """List available Chrome DevTools tools."""
-            return [
-                Tool(
-                    name="chrome_navigate",
-                    description="Navigate to a URL in Chrome. Waits for page load.",
-                    inputSchema={
-                        "type": "object",
-                        "properties": _with_session_id(
-                            {
-                                "url": {
-                                    "type": "string",
-                                    "description": "The URL to navigate to",
-                                },
-                            }
-                        ),
-                        "required": ["url"],
-                    },
-                ),
-                Tool(
-                    name="chrome_screenshot",
-                    description="Take a screenshot of the current page.",
-                    inputSchema={
-                        "type": "object",
-                        "properties": _with_session_id(
-                            {
-                                "full_page": {
-                                    "type": "boolean",
-                                    "description": "Capture full page (default: false)",
-                                    "default": False,
-                                },
-                                "format": {
-                                    "type": "string",
-                                    "enum": ["png", "jpeg"],
-                                    "description": "Image format (default: png)",
-                                    "default": "png",
-                                },
-                            }
-                        ),
-                    },
-                ),
-                Tool(
-                    name="chrome_click",
-                    description="Click on an element using a CSS selector.",
-                    inputSchema={
-                        "type": "object",
-                        "properties": _with_session_id(
-                            {
-                                "selector": {
-                                    "type": "string",
-                                    "description": "CSS selector of element to click",
-                                },
-                            }
-                        ),
-                        "required": ["selector"],
-                    },
-                ),
-                Tool(
-                    name="chrome_type",
-                    description="Type text into an input element.",
-                    inputSchema={
-                        "type": "object",
-                        "properties": _with_session_id(
-                            {
-                                "selector": {
-                                    "type": "string",
-                                    "description": "CSS selector of input element",
-                                },
-                                "text": {
-                                    "type": "string",
-                                    "description": "Text to type",
-                                },
-                                "clear_first": {
-                                    "type": "boolean",
-                                    "description": "Clear input first (default: true)",
-                                    "default": True,
-                                },
-                            }
-                        ),
-                        "required": ["selector", "text"],
-                    },
-                ),
-                Tool(
-                    name="chrome_get_html",
-                    description="Get HTML content of page or element.",
-                    inputSchema={
-                        "type": "object",
-                        "properties": _with_session_id(
-                            {
-                                "selector": {
-                                    "type": "string",
-                                    "description": "CSS selector (optional)",
-                                },
-                            }
-                        ),
-                    },
-                ),
-                Tool(
-                    name="chrome_evaluate",
-                    description="Execute JavaScript and return result.",
-                    inputSchema={
-                        "type": "object",
-                        "properties": _with_session_id(
-                            {
-                                "expression": {
-                                    "type": "string",
-                                    "description": "JavaScript to evaluate",
-                                },
-                            }
-                        ),
-                        "required": ["expression"],
-                    },
-                ),
-                Tool(
-                    name="chrome_console",
-                    description="Get console messages from the browser.",
-                    inputSchema={
-                        "type": "object",
-                        "properties": _with_session_id(
-                            {
-                                "clear": {
-                                    "type": "boolean",
-                                    "description": "Clear after returning",
-                                    "default": False,
-                                },
-                            }
-                        ),
-                    },
-                ),
-                Tool(
-                    name="chrome_network",
-                    description="Get network requests made by the page.",
-                    inputSchema={
-                        "type": "object",
-                        "properties": _with_session_id(
-                            {
-                                "clear": {
-                                    "type": "boolean",
-                                    "description": "Clear after returning",
-                                    "default": False,
-                                },
-                            }
-                        ),
-                    },
-                ),
-                Tool(
-                    name="chrome_wait",
-                    description="Wait for an element to appear.",
-                    inputSchema={
-                        "type": "object",
-                        "properties": _with_session_id(
-                            {
-                                "selector": {
-                                    "type": "string",
-                                    "description": "CSS selector to wait for",
-                                },
-                                "timeout": {
-                                    "type": "number",
-                                    "description": "Max wait in seconds (default: 10)",
-                                    "default": 10,
-                                },
-                            }
-                        ),
-                        "required": ["selector"],
-                    },
-                ),
-                Tool(
-                    name="chrome_scroll",
-                    description="Scroll the page or an element.",
-                    inputSchema={
-                        "type": "object",
-                        "properties": _with_session_id(
-                            {
-                                "direction": {
-                                    "type": "string",
-                                    "enum": ["up", "down", "left", "right", "top", "bottom"],
-                                    "description": "Direction to scroll",
-                                },
-                                "amount": {
-                                    "type": "number",
-                                    "description": "Pixels to scroll (default: 500)",
-                                    "default": 500,
-                                },
-                                "selector": {
-                                    "type": "string",
-                                    "description": "Element selector (optional)",
-                                },
-                            }
-                        ),
-                        "required": ["direction"],
-                    },
-                ),
-                Tool(
-                    name="chrome_tabs",
-                    description="List all open tabs in this session.",
-                    inputSchema={
-                        "type": "object",
-                        "properties": _with_session_id({}),
-                    },
-                ),
-                Tool(
-                    name="chrome_new_tab",
-                    description="Open a new tab in this session.",
-                    inputSchema={
-                        "type": "object",
-                        "properties": _with_session_id(
-                            {
-                                "url": {
-                                    "type": "string",
-                                    "description": "URL to open (default: about:blank)",
-                                    "default": "about:blank",
-                                },
-                            }
-                        ),
-                    },
-                ),
-                Tool(
-                    name="chrome_close_tab",
-                    description="Close a tab.",
-                    inputSchema={
-                        "type": "object",
-                        "properties": _with_session_id(
-                            {
-                                "tab_id": {
-                                    "type": "string",
-                                    "description": "ID of tab to close",
-                                },
-                            }
-                        ),
-                        "required": ["tab_id"],
-                    },
-                ),
-                Tool(
-                    name="chrome_switch_tab",
-                    description="Switch to a different tab.",
-                    inputSchema={
-                        "type": "object",
-                        "properties": _with_session_id(
-                            {
-                                "tab_id": {
-                                    "type": "string",
-                                    "description": "ID of tab to switch to",
-                                },
-                            }
-                        ),
-                        "required": ["tab_id"],
-                    },
-                ),
-                Tool(
-                    name="chrome_pdf",
-                    description="Generate a PDF of the current page.",
-                    inputSchema={
-                        "type": "object",
-                        "properties": _with_session_id(
-                            {
-                                "landscape": {
-                                    "type": "boolean",
-                                    "description": "Landscape orientation",
-                                    "default": False,
-                                },
-                                "print_background": {
-                                    "type": "boolean",
-                                    "description": "Print background graphics",
-                                    "default": True,
-                                },
-                            }
-                        ),
-                    },
-                ),
-                Tool(
-                    name="chrome_session_start",
-                    description="Start a Chrome session. Auto-created on first tool call.",
-                    inputSchema={
-                        "type": "object",
-                        "properties": _with_session_id(
-                            {
-                                "url": {
-                                    "type": "string",
-                                    "description": "URL to open (default: about:blank)",
-                                    "default": "about:blank",
-                                },
-                            }
-                        ),
-                    },
-                ),
-                Tool(
-                    name="chrome_session_list",
-                    description="List all active Chrome sessions.",
-                    inputSchema={
-                        "type": "object",
-                        "properties": {},
-                    },
-                ),
-                Tool(
-                    name="chrome_session_end",
-                    description="End a session, killing its Chrome process.",
-                    inputSchema={
-                        "type": "object",
-                        "properties": _with_session_id({}),
-                        "required": ["session_id"],
-                    },
-                ),
-            ]
+            return [tool_def.to_mcp_tool(SESSION_ID_PROPERTY) for tool_def in get_all_tools()]
 
         @self.server.call_tool()
         async def call_tool(
@@ -380,151 +178,38 @@ class ChromeMCPServer:
                 session_id = arguments.pop("session_id", "default")
                 logger.info("call_tool: %s session_id=%s", name, session_id)
 
-                # Ensure pool is initialized
                 if self._pool is None:
                     self._pool = ChromePoolManager()
 
-                # Session management tools
-                if name == "chrome_session_start":
-                    return await self._session_start(
-                        session_id, arguments.get("url", "about:blank")
-                    )
-                elif name == "chrome_session_list":
-                    return await self._session_list()
-                elif name == "chrome_session_end":
+                # Resolve tool name aliases
+                resolved_name = TOOL_ALIASES.get(name, name)
+
+                # Session destroy is special: destroys the instance
+                if resolved_name == SESSION_DESTROY_TOOL:
                     return await self._session_end(session_id)
 
-                # Get or create Chrome instance for this session
+                # All other tools: get or create Chrome instance
                 instance = await self._pool.get_or_create(session_id)
 
-                # Route to appropriate handler
-                return await self._handle_tool(name, arguments, instance)
+                if not instance.is_connected and not instance.proxy:
+                    return [
+                        TextContent(
+                            type="text",
+                            text=f"Error: No connection for session {session_id}",
+                        )
+                    ]
+
+                # Look up tool in registry and dispatch
+                tool_def = get_tool(resolved_name)
+                if tool_def:
+                    ctx = ToolContextImpl(instance, self._pool)
+                    return await tool_def.handler(arguments, ctx)
+
+                return [TextContent(type="text", text=f"Unknown tool: {name}")]
 
             except Exception as e:
                 logger.exception(f"Error in tool {name}")
                 return [TextContent(type="text", text=f"Error: {e!s}")]
-
-    async def _handle_tool(
-        self, name: str, arguments: dict[str, Any], instance: ChromeInstance
-    ) -> ContentResult:
-        """Handle a tool call for a specific Chrome instance."""
-        ws_url = instance.current_ws_url
-        if ws_url is None:
-            return [
-                TextContent(
-                    type="text",
-                    text=f"Error: No active tab in session {instance.session_id}",
-                )
-            ]
-
-        proxy = instance.proxy
-
-        if name == "chrome_navigate":
-            return await self._navigate(proxy, ws_url, arguments["url"])
-        elif name == "chrome_screenshot":
-            return await self._screenshot(
-                proxy,
-                ws_url,
-                arguments.get("full_page", False),
-                arguments.get("format", "png"),
-            )
-        elif name == "chrome_click":
-            return await self._click(proxy, ws_url, arguments["selector"])
-        elif name == "chrome_type":
-            return await self._type(
-                proxy,
-                ws_url,
-                arguments["selector"],
-                arguments["text"],
-                arguments.get("clear_first", True),
-            )
-        elif name == "chrome_get_html":
-            return await self._get_html(proxy, ws_url, arguments.get("selector"))
-        elif name == "chrome_evaluate":
-            return await self._evaluate(proxy, ws_url, arguments["expression"])
-        elif name == "chrome_console":
-            return [
-                TextContent(
-                    type="text",
-                    text="Console monitoring not available in this mode.",
-                )
-            ]
-        elif name == "chrome_network":
-            return [
-                TextContent(
-                    type="text",
-                    text="Network monitoring not available in this mode.",
-                )
-            ]
-        elif name == "chrome_wait":
-            return await self._wait_for(
-                proxy,
-                ws_url,
-                arguments["selector"],
-                arguments.get("timeout", 10),
-            )
-        elif name == "chrome_scroll":
-            return await self._scroll(
-                proxy,
-                ws_url,
-                arguments["direction"],
-                arguments.get("amount", 500),
-                arguments.get("selector"),
-            )
-        elif name == "chrome_tabs":
-            return await self._list_tabs(instance)
-        elif name == "chrome_new_tab":
-            return await self._new_tab(instance, arguments.get("url", "about:blank"))
-        elif name == "chrome_close_tab":
-            return await self._close_tab(instance, arguments["tab_id"])
-        elif name == "chrome_switch_tab":
-            return await self._switch_tab(instance, arguments["tab_id"])
-        elif name == "chrome_pdf":
-            return await self._generate_pdf(
-                proxy,
-                ws_url,
-                arguments.get("landscape", False),
-                arguments.get("print_background", True),
-            )
-        else:
-            return [TextContent(type="text", text=f"Unknown tool: {name}")]
-
-    # --- Session management ---
-
-    async def _session_start(self, session_id: str, url: str) -> ContentResult:
-        """Start a new session with its own Chrome instance."""
-        assert self._pool is not None
-        instance = await self._pool.get_or_create(session_id)
-
-        if url != "about:blank" and instance.current_ws_url:
-            await instance.proxy.navigate(instance.current_ws_url, url)
-
-        return [
-            TextContent(
-                type="text",
-                text=(
-                    f"Session started: {session_id}\n"
-                    f"Port: {instance.port}\n"
-                    f"Tab: {instance.current_target_id}"
-                ),
-            )
-        ]
-
-    async def _session_list(self) -> ContentResult:
-        """List all active sessions."""
-        assert self._pool is not None
-        sessions = self._pool.list_sessions()
-
-        if not sessions:
-            return [TextContent(type="text", text="No active sessions.")]
-
-        lines = ["Active sessions:"]
-        for sid, info in sessions.items():
-            lines.append(
-                f"  - {sid}: port={info['port']}, pid={info['pid']}, tabs={info['tab_count']}"
-            )
-
-        return [TextContent(type="text", text="\n".join(lines))]
 
     async def _session_end(self, session_id: str) -> ContentResult:
         """End a session, killing its Chrome process."""
@@ -534,219 +219,6 @@ class ChromeMCPServer:
             return [TextContent(type="text", text=f"Session ended: {session_id}")]
         except KeyError:
             return [TextContent(type="text", text=f"Session not found: {session_id}")]
-
-    # --- Tool handlers ---
-
-    async def _navigate(self, proxy: CDPProxyClient, ws_url: str, url: str) -> ContentResult:
-        """Navigate to a URL."""
-        result = await proxy.navigate(ws_url, url)
-        title = await proxy.evaluate(ws_url, "document.title")
-        frame_id = result.get("frameId", "unknown")
-        return [
-            TextContent(
-                type="text",
-                text=f"Navigated to: {url}\nTitle: {title}\nFrame ID: {frame_id}",
-            )
-        ]
-
-    async def _screenshot(
-        self, proxy: CDPProxyClient, ws_url: str, full_page: bool, format: str
-    ) -> ContentResult:
-        """Take a screenshot."""
-        image_data = await proxy.screenshot(ws_url, format=format, full_page=full_page)
-        return [
-            ImageContent(
-                type="image",
-                data=base64.b64encode(image_data).decode("utf-8"),
-                mimeType=f"image/{format}",
-            )
-        ]
-
-    async def _click(self, proxy: CDPProxyClient, ws_url: str, selector: str) -> ContentResult:
-        """Click on an element."""
-        js = f"""
-        (function() {{
-            const el = document.querySelector({json.dumps(selector)});
-            if (!el) return {{ error: 'Element not found: {selector}' }};
-            el.click();
-            return {{ success: true, tagName: el.tagName }};
-        }})()
-        """
-        result = await proxy.evaluate(ws_url, js)
-
-        if isinstance(result, dict) and result.get("error"):
-            return [TextContent(type="text", text=f"Error: {result['error']}")]
-
-        tag = result.get("tagName", "unknown") if isinstance(result, dict) else "unknown"
-        return [TextContent(type="text", text=f"Clicked on {selector} ({tag})")]
-
-    async def _type(
-        self,
-        proxy: CDPProxyClient,
-        ws_url: str,
-        selector: str,
-        text: str,
-        clear_first: bool,
-    ) -> ContentResult:
-        """Type text into an input."""
-        js = f"""
-        (function() {{
-            const el = document.querySelector({json.dumps(selector)});
-            if (!el) return {{ error: 'Element not found: {selector}' }};
-            el.focus();
-            if ({str(clear_first).lower()}) {{
-                el.value = '';
-            }}
-            el.value = {json.dumps(text)};
-            el.dispatchEvent(new Event('input', {{ bubbles: true }}));
-            el.dispatchEvent(new Event('change', {{ bubbles: true }}));
-            return {{ success: true }};
-        }})()
-        """
-        result = await proxy.evaluate(ws_url, js)
-
-        if isinstance(result, dict) and result.get("error"):
-            return [TextContent(type="text", text=f"Error: {result['error']}")]
-
-        return [TextContent(type="text", text=f"Typed into {selector}")]
-
-    async def _get_html(
-        self, proxy: CDPProxyClient, ws_url: str, selector: str | None
-    ) -> ContentResult:
-        """Get HTML content."""
-        if selector:
-            js = f"""
-            (function() {{
-                const el = document.querySelector({json.dumps(selector)});
-                if (!el) return {{ error: 'Element not found: {selector}' }};
-                return {{ html: el.outerHTML }};
-            }})()
-            """
-            result = await proxy.evaluate(ws_url, js)
-
-            if isinstance(result, dict) and result.get("error"):
-                return [TextContent(type="text", text=f"Error: {result['error']}")]
-            html = result.get("html", "") if isinstance(result, dict) else ""
-        else:
-            html = await proxy.get_html(ws_url)
-
-        return [TextContent(type="text", text=html)]
-
-    async def _evaluate(self, proxy: CDPProxyClient, ws_url: str, expression: str) -> ContentResult:
-        """Evaluate JavaScript."""
-        result = await proxy.evaluate(ws_url, expression)
-        return [TextContent(type="text", text=json.dumps(result, indent=2, default=str))]
-
-    async def _wait_for(
-        self, proxy: CDPProxyClient, ws_url: str, selector: str, timeout: float
-    ) -> ContentResult:
-        """Wait for an element to appear."""
-        deadline = asyncio.get_event_loop().time() + timeout
-        poll_interval = 0.5
-
-        while asyncio.get_event_loop().time() < deadline:
-            js = f"document.querySelector({json.dumps(selector)}) !== null"
-            found = await proxy.evaluate(ws_url, js)
-            if found:
-                return [TextContent(type="text", text=f"Element found: {selector}")]
-            await asyncio.sleep(poll_interval)
-
-        return [
-            TextContent(
-                type="text",
-                text=f"Timeout: Element not found after {timeout}s: {selector}",
-            )
-        ]
-
-    async def _scroll(
-        self,
-        proxy: CDPProxyClient,
-        ws_url: str,
-        direction: str,
-        amount: int,
-        selector: str | None,
-    ) -> ContentResult:
-        """Scroll the page or element."""
-        target = f"document.querySelector({json.dumps(selector)})" if selector else "window"
-
-        scroll_code = {
-            "up": f"{target}.scrollBy(0, -{amount})",
-            "down": f"{target}.scrollBy(0, {amount})",
-            "left": f"{target}.scrollBy(-{amount}, 0)",
-            "right": f"{target}.scrollBy({amount}, 0)",
-            "top": f"{target}.scrollTo(0, 0)",
-            "bottom": f"{target}.scrollTo(0, document.body.scrollHeight)",
-        }
-
-        js = scroll_code.get(direction, f"{target}.scrollBy(0, {amount})")
-        await proxy.evaluate(ws_url, js)
-
-        return [TextContent(type="text", text=f"Scrolled {direction}")]
-
-    async def _list_tabs(self, instance: ChromeInstance) -> ContentResult:
-        """List tabs in this session."""
-        assert self._pool is not None
-        tabs = await self._pool.list_tabs(instance.session_id)
-
-        if not tabs:
-            return [TextContent(type="text", text="No tabs open.")]
-
-        lines = ["Open tabs:"]
-        for tab in tabs:
-            current = " (current)" if tab["is_current"] else ""
-            lines.append(f"  - [{tab['id']}] {tab['title'] or 'Untitled'}: {tab['url']}{current}")
-
-        return [TextContent(type="text", text="\n".join(lines))]
-
-    async def _new_tab(self, instance: ChromeInstance, url: str) -> ContentResult:
-        """Open a new tab."""
-        assert self._pool is not None
-        target_id = await self._pool.create_tab(instance.session_id, url)
-        return [TextContent(type="text", text=f"Opened new tab: [{target_id}] {url}")]
-
-    async def _close_tab(self, instance: ChromeInstance, tab_id: str) -> ContentResult:
-        """Close a tab."""
-        assert self._pool is not None
-        try:
-            await self._pool.close_tab(instance.session_id, tab_id)
-            return [TextContent(type="text", text=f"Closed tab: {tab_id}")]
-        except ValueError as e:
-            return [TextContent(type="text", text=f"Error: {e}")]
-
-    async def _switch_tab(self, instance: ChromeInstance, tab_id: str) -> ContentResult:
-        """Switch to a different tab."""
-        assert self._pool is not None
-        try:
-            await self._pool.switch_tab(instance.session_id, tab_id)
-            return [TextContent(type="text", text=f"Switched to tab: {tab_id}")]
-        except ValueError as e:
-            return [TextContent(type="text", text=f"Error: {e}")]
-
-    async def _generate_pdf(
-        self, proxy: CDPProxyClient, ws_url: str, landscape: bool, print_background: bool
-    ) -> ContentResult:
-        """Generate a PDF."""
-        result = await proxy.send_cdp_command(
-            ws_url,
-            "Page.printToPDF",
-            {
-                "landscape": landscape,
-                "printBackground": print_background,
-                "preferCSSPageSize": True,
-            },
-        )
-        pdf_data = result["data"]
-
-        return [
-            EmbeddedResource(
-                type="resource",
-                resource={
-                    "uri": AnyUrl("data:application/pdf;base64"),
-                    "mimeType": "application/pdf",
-                    "blob": pdf_data,
-                },
-            )
-        ]
 
     # --- Lifecycle ---
 
@@ -779,6 +251,9 @@ class ChromeMCPServer:
 
 def main() -> None:
     """Main entry point."""
+    from dotenv import load_dotenv
+
+    load_dotenv()
     server = ChromeMCPServer()
     asyncio.run(server.run())
 
