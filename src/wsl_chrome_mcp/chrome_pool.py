@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any
@@ -16,7 +17,7 @@ from typing import Any
 from .cdp_proxy import CDPProxyClient
 from .persistent_cdp import PersistentCDPClient, enable_domains
 from .tunnel import PortForwarderManager, WindowsPortForwarder
-from .wsl import is_wsl, run_windows_command
+from .wsl import get_windows_host_ip, is_wsl, run_windows_command
 
 logger = logging.getLogger(__name__)
 
@@ -362,11 +363,8 @@ class ChromePoolManager:
     async def _connect_cdp(self, instance: ChromeInstance, target_id: str) -> None:
         """Establish persistent CDP connection for a target.
 
-        Requires either a working tunnel (WSL) or direct access (non-WSL).
-
-        Args:
-            instance: The Chrome instance.
-            target_id: Target ID to connect to.
+        In WSL, rewrites the WebSocket URL to use the Windows host IP
+        so PersistentCDPClient can connect directly from WSL2.
 
         Raises:
             RuntimeError: If no connection method is available.
@@ -385,20 +383,23 @@ class ChromePoolManager:
         if not original_ws_url:
             raise RuntimeError(f"No WebSocket URL for target {target_id}")
 
-        # Build the WebSocket URL:
-        # - With forwarder (WSL): use forwarder's host:port
-        # - Without forwarder (non-WSL): use the original URL directly
-        if instance.forwarder:
-            ws_path = (
-                original_ws_url.split("/devtools/")[-1] if "/devtools/" in original_ws_url else ""
-            )
-            ws_url = instance.forwarder.get_ws_url(f"/devtools/{ws_path}")
-            logger.debug("Connecting CDP via forwarder: %s", ws_url)
-        elif not is_wsl():
+        if not is_wsl():
             ws_url = original_ws_url
             logger.debug("Connecting CDP directly: %s", ws_url)
         else:
-            raise RuntimeError("Cannot establish persistent CDP in WSL without forwarder")
+            # WSL2→Windows: rewrite localhost to Windows host IP
+            # (Chrome listens on 0.0.0.0 via --remote-debugging-address)
+            windows_host = get_windows_host_ip()
+            ws_url = re.sub(
+                r"ws://(127\.0\.0\.1|localhost)(:\d+)",
+                f"ws://{windows_host}\\2",
+                original_ws_url,
+            )
+            logger.debug(
+                "Connecting CDP from WSL2 via Windows host: %s (host IP: %s)",
+                ws_url,
+                windows_host,
+            )
 
         # Disconnect previous CDP client if any
         if instance.cdp and instance.cdp.is_connected:
@@ -452,6 +453,7 @@ class ChromePoolManager:
         args = [
             f"--remote-debugging-port={port}",
             "--remote-debugging-address=0.0.0.0",
+            "--remote-allow-origins=*",
             f"--user-data-dir={user_data_dir}",
             "--no-first-run",
             "--no-default-browser-check",
@@ -539,8 +541,7 @@ class ChromePoolManager:
             targets=[initial_target_id] if initial_target_id else [],
         )
 
-        # Establish persistent CDP connection (requires working forwarder in WSL)
-        if initial_target_id and forwarder is not None:
+        if initial_target_id:
             try:
                 await self._connect_cdp(instance, initial_target_id)
             except Exception as e:
