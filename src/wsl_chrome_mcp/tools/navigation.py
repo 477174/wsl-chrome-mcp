@@ -20,6 +20,7 @@ from .base import (
     ToolDefinition,
     register_tool,
 )
+from .snapshot import capture_snapshot
 
 logger = logging.getLogger(__name__)
 
@@ -70,6 +71,8 @@ async def _navigate_page_handler(args: dict[str, Any], ctx: ToolContext) -> Cont
         pass  # CDP Page.navigate auto-handles beforeunload
 
     try:
+        nav_result: str | None = None
+
         if nav_type == "url":
             if not url:
                 return [TextContent(type="text", text="Error: URL required for type=url")]
@@ -78,12 +81,7 @@ async def _navigate_page_handler(args: dict[str, Any], ctx: ToolContext) -> Cont
                 await _wait_for_load(ctx, timeout_s)
                 title = await ctx.evaluate_js("document.title")
                 frame_id = result.get("frameId", "unknown")
-                return [
-                    TextContent(
-                        type="text",
-                        text=f"Navigated to {url}\nTitle: {title}\nFrame: {frame_id}",
-                    )
-                ]
+                nav_result = f"Navigated to {url}\nTitle: {title}\nFrame: {frame_id}"
             except Exception as e:
                 return [TextContent(type="text", text=f"Navigation error: {e}")]
 
@@ -97,8 +95,9 @@ async def _navigate_page_handler(args: dict[str, Any], ctx: ToolContext) -> Cont
                 )
                 await _wait_for_load(ctx, timeout_s)
                 new_url = await ctx.evaluate_js("window.location.href")
-                return [TextContent(type="text", text=f"Navigated back to {new_url}")]
-            return [TextContent(type="text", text="Cannot go back: at start of history")]
+                nav_result = f"Navigated back to {new_url}"
+            else:
+                return [TextContent(type="text", text="Cannot go back: at start of history")]
 
         elif nav_type == "forward":
             history = await ctx.send_cdp("Page.getNavigationHistory")
@@ -110,16 +109,32 @@ async def _navigate_page_handler(args: dict[str, Any], ctx: ToolContext) -> Cont
                 )
                 await _wait_for_load(ctx, timeout_s)
                 new_url = await ctx.evaluate_js("window.location.href")
-                return [TextContent(type="text", text=f"Navigated forward to {new_url}")]
-            return [TextContent(type="text", text="Cannot go forward: at end of history")]
+                nav_result = f"Navigated forward to {new_url}"
+            else:
+                return [TextContent(type="text", text="Cannot go forward: at end of history")]
 
         elif nav_type == "reload":
             ignore_cache = args.get("ignoreCache", False)
             await ctx.send_cdp("Page.reload", {"ignoreCache": ignore_cache})
             await _wait_for_load(ctx, timeout_s)
-            return [TextContent(type="text", text="Successfully reloaded the page")]
+            nav_result = "Successfully reloaded the page"
 
-        return [TextContent(type="text", text=f"Unknown navigation type: {nav_type}")]
+        else:
+            return [TextContent(type="text", text=f"Unknown navigation type: {nav_type}")]
+
+        if nav_result is None:
+            return [TextContent(type="text", text=f"Unknown navigation type: {nav_type}")]
+
+        try:
+            snapshot_text = await capture_snapshot(ctx)
+            return [
+                TextContent(
+                    type="text", text=f"{nav_result}\n\n--- Page Snapshot ---\n{snapshot_text}"
+                )
+            ]
+        except Exception as e:
+            logger.warning("Post-navigation snapshot failed: %s", e)
+            return [TextContent(type="text", text=nav_result)]
 
     finally:
         # Clean up init script
@@ -134,7 +149,10 @@ async def _navigate_page_handler(args: dict[str, Any], ctx: ToolContext) -> Cont
 navigate_page = register_tool(
     ToolDefinition(
         name="navigate_page",
-        description="Navigate the selected page by URL, back, forward, or reload.",
+        description=(
+            "Navigate the selected page by URL, back, forward, or reload. "
+            "Returns a page snapshot with element UIDs for subsequent interactions."
+        ),
         category=ToolCategory.NAVIGATION,
         read_only=False,
         schema={

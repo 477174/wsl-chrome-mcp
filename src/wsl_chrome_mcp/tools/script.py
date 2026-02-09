@@ -96,8 +96,10 @@ evaluate = register_tool(
     ToolDefinition(
         name="evaluate",
         description=(
-            "Execute JavaScript in the page context and return the result. "
-            "Supports expression or function with element handle args."
+            "Execute JavaScript in the page context. Use this ONLY when no "
+            "other tool can accomplish the task (e.g., reading computed styles, "
+            "custom DOM queries). For clicking, typing, and form filling, "
+            "prefer click, fill, and fill_form with UIDs from take_snapshot."
         ),
         category=ToolCategory.SCRIPT,
         read_only=False,

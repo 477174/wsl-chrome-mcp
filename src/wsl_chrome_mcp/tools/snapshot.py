@@ -181,36 +181,35 @@ class SnapshotBuilder:
         return root_nodes
 
 
-async def _take_snapshot_handler(args: dict[str, Any], ctx: ToolContext) -> ContentResult:
-    """Take an accessibility tree snapshot of the page."""
-    verbose = args.get("verbose", False)
+async def capture_snapshot(ctx: ToolContext, verbose: bool = False) -> str:
+    """Capture an accessibility snapshot and update the instance cache.
 
-    # Enable accessibility domain
+    This is the core snapshot logic shared by take_snapshot, includeSnapshot,
+    and auto-snapshot-after-navigation.
+
+    Returns:
+        Formatted snapshot text with element count summary.
+    """
     await ctx.send_cdp("Accessibility.enable")
 
-    # Get the full accessibility tree
     result = await ctx.send_cdp("Accessibility.getFullAXTree")
     nodes = result.get("nodes", [])
 
     if not nodes:
-        return [TextContent(type="text", text="No accessibility tree available.")]
+        return "No accessibility tree available."
 
-    # Build and format the snapshot
-    # Use a simple incrementing snapshot ID based on instance state
     snapshot_id = getattr(ctx.instance, "_snapshot_counter", 0) + 1
     ctx.instance._snapshot_counter = snapshot_id  # type: ignore[attr-defined]
 
     builder = SnapshotBuilder(snapshot_id=snapshot_id, verbose=verbose)
     root_nodes = builder.build_tree(nodes)
 
-    # Format the tree
     lines = []
     for root in root_nodes:
         text = builder.format_node(root, 0)
         if text:
             lines.append(text)
 
-    # Store UID mapping in instance for later use by input tools
     ctx.instance.snapshot_cache = builder.uid_map
     ctx.instance.snapshot_node_ids = {
         uid: info["backendNodeId"]
@@ -219,14 +218,34 @@ async def _take_snapshot_handler(args: dict[str, Any], ctx: ToolContext) -> Cont
     }
 
     snapshot_text = "\n".join(lines)
-
-    # Add summary
     element_count = len(builder.uid_map)
-    summary = f"\n\n[{element_count} elements]"
+    return f"{snapshot_text}\n\n[{element_count} elements]"
 
-    full_text = snapshot_text + summary
 
-    # Save to file if filePath provided
+async def maybe_include_snapshot(
+    args: dict[str, Any], ctx: ToolContext, action_result: ContentResult
+) -> ContentResult:
+    """Append a snapshot to the action result if includeSnapshot is true."""
+    if not args.get("includeSnapshot", False):
+        return action_result
+
+    try:
+        snapshot_text = await capture_snapshot(ctx)
+        return [
+            *action_result,
+            TextContent(type="text", text=f"\n--- Page Snapshot ---\n{snapshot_text}"),
+        ]
+    except Exception as e:
+        logger.warning("Failed to capture post-action snapshot: %s", e)
+        return action_result
+
+
+async def _take_snapshot_handler(args: dict[str, Any], ctx: ToolContext) -> ContentResult:
+    """Take an accessibility tree snapshot of the page."""
+    verbose = args.get("verbose", False)
+
+    full_text = await capture_snapshot(ctx, verbose=verbose)
+
     file_path = args.get("filePath")
     if file_path:
         try:
@@ -243,10 +262,10 @@ take_snapshot = register_tool(
     ToolDefinition(
         name="take_snapshot",
         description=(
-            "Take a text snapshot of the currently selected page based on the "
-            "accessibility tree. The snapshot lists page elements with unique "
-            "identifiers (uid). Always use the latest snapshot. "
-            "Prefer taking a snapshot over taking a screenshot."
+            "Capture the page's accessibility tree as text with unique element "
+            "identifiers (uid). UIDs are REQUIRED by click, fill, hover, drag, "
+            "and other input tools. Always call this before interacting with "
+            "elements. Prefer this over take_screenshot for understanding page content."
         ),
         category=ToolCategory.SNAPSHOT,
         read_only=False,  # Not read-only due to filePath option
