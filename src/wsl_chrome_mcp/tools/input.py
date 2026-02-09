@@ -23,6 +23,7 @@ from .base import (
     ToolDefinition,
     register_tool,
 )
+from .snapshot import maybe_include_snapshot
 
 logger = logging.getLogger(__name__)
 
@@ -79,22 +80,16 @@ async def get_element_center(ctx: ToolContext, backend_node_id: int) -> tuple[fl
 
 
 async def scroll_element_into_view(ctx: ToolContext, backend_node_id: int) -> None:
-    """Scroll element into view using CDP."""
+    """Scroll element into view using CDP.
+
+    Uses DOM.scrollIntoViewIfNeeded with backendNodeId directly,
+    avoiding objectId resolution which can go stale on React re-renders.
+    """
     try:
-        result = await ctx.send_cdp("DOM.resolveNode", {"backendNodeId": backend_node_id})
-        object_id = result.get("object", {}).get("objectId")
-        if object_id:
-            await ctx.send_cdp(
-                "Runtime.callFunctionOn",
-                {
-                    "objectId": object_id,
-                    "functionDeclaration": """
-                        function() {
-                            this.scrollIntoViewIfNeeded();
-                        }
-                    """,
-                },
-            )
+        await ctx.send_cdp(
+            "DOM.scrollIntoViewIfNeeded",
+            {"backendNodeId": backend_node_id},
+        )
     except Exception as e:
         logger.debug("scrollIntoView failed: %s", e)
 
@@ -162,19 +157,105 @@ async def click_element(ctx: ToolContext, uid: str, double_click: bool = False) 
         return False, f"Click failed: {e}"
 
 
+async def _clear_input_via_keyboard(ctx: ToolContext) -> None:
+    """Select all text and delete it using keyboard events (Ctrl+A, Backspace)."""
+    await ctx.send_cdp(
+        "Input.dispatchKeyEvent",
+        {
+            "type": "keyDown",
+            "key": "a",
+            "code": "KeyA",
+            "windowsVirtualKeyCode": 65,
+            "nativeVirtualKeyCode": 65,
+            "modifiers": 2,
+        },
+    )
+    await ctx.send_cdp(
+        "Input.dispatchKeyEvent",
+        {
+            "type": "keyUp",
+            "key": "a",
+            "code": "KeyA",
+            "modifiers": 2,
+        },
+    )
+    await ctx.send_cdp(
+        "Input.dispatchKeyEvent",
+        {
+            "type": "keyDown",
+            "key": "Backspace",
+            "code": "Backspace",
+            "windowsVirtualKeyCode": 8,
+            "nativeVirtualKeyCode": 8,
+        },
+    )
+    await ctx.send_cdp(
+        "Input.dispatchKeyEvent",
+        {
+            "type": "keyUp",
+            "key": "Backspace",
+            "code": "Backspace",
+        },
+    )
+
+
+async def _fill_select_element(
+    ctx: ToolContext, backend_node_id: int, value: str
+) -> tuple[bool, str]:
+    """Fill a select/combobox element using React-compatible JS setter.
+
+    Select elements can't use Input.insertText, so we resolve the node
+    and use the native HTMLSelectElement.prototype.value setter to
+    bypass React's synthetic event system.
+    """
+    try:
+        result = await ctx.send_cdp("DOM.resolveNode", {"backendNodeId": backend_node_id})
+        object_id = result.get("object", {}).get("objectId")
+        if not object_id:
+            return False, "Could not resolve select element"
+
+        await ctx.send_cdp(
+            "Runtime.callFunctionOn",
+            {
+                "objectId": object_id,
+                "functionDeclaration": """
+                    function(newValue) {
+                        var setter = Object.getOwnPropertyDescriptor(
+                            window.HTMLSelectElement.prototype, 'value'
+                        );
+                        if (setter && setter.set) {
+                            setter.set.call(this, newValue);
+                        } else {
+                            this.value = newValue;
+                        }
+                        this.dispatchEvent(new Event('input', { bubbles: true }));
+                        this.dispatchEvent(new Event('change', { bubbles: true }));
+                    }
+                """,
+                "arguments": [{"value": value}],
+            },
+        )
+        return True, "Successfully selected value"
+
+    except Exception as e:
+        logger.warning("CDP select fill failed: %s", e)
+        return False, f"Select fill failed: {e}"
+
+
+_SELECT_ROLES = frozenset({"combobox", "listbox"})
+
+
 async def fill_element(
     ctx: ToolContext, uid: str, value: str, clear_first: bool = True
 ) -> tuple[bool, str]:
     """Fill text into element by UID using CDP.
 
-    Args:
-        ctx: Tool context
-        uid: Element UID from take_snapshot
-        value: Text value to fill
-        clear_first: Whether to clear existing value first
+    For text inputs/textareas: uses DOM.focus + keyboard clear + Input.insertText.
+    This avoids objectId resolution entirely, preventing stale-object errors
+    on React/SPA re-renders.
 
-    Returns:
-        (success, message) tuple
+    For select/combobox: uses React-compatible JS setter as fallback since
+    Input.insertText doesn't work on select elements.
     """
     try:
         element = await get_element_info(ctx, uid)
@@ -185,32 +266,18 @@ async def fill_element(
     if not backend_node_id:
         return False, f"Element uid={uid} has no backendNodeId for CDP interaction"
 
+    role = element.get("role", "")
+
+    if role in _SELECT_ROLES:
+        return await _fill_select_element(ctx, backend_node_id, value)
+
     try:
-        # Focus the element
         await ctx.send_cdp("DOM.focus", {"backendNodeId": backend_node_id})
 
-        # Get objectId for the element
-        result = await ctx.send_cdp("DOM.resolveNode", {"backendNodeId": backend_node_id})
-        object_id = result.get("object", {}).get("objectId")
+        if clear_first:
+            await _clear_input_via_keyboard(ctx)
 
-        if object_id:
-            # Use JavaScript to set the value (most reliable cross-element)
-            clear_js = "this.value = '';" if clear_first else ""
-            await ctx.send_cdp(
-                "Runtime.callFunctionOn",
-                {
-                    "objectId": object_id,
-                    "functionDeclaration": f"""
-                        function(newValue) {{
-                            {clear_js}
-                            this.value = newValue;
-                            this.dispatchEvent(new Event('input', {{ bubbles: true }}));
-                            this.dispatchEvent(new Event('change', {{ bubbles: true }}));
-                        }}
-                    """,
-                    "arguments": [{"value": value}],
-                },
-            )
+        await ctx.send_cdp("Input.insertText", {"text": value})
 
         return True, f"Successfully filled element uid={uid}"
 
@@ -261,21 +328,33 @@ async def hover_element(ctx: ToolContext, uid: str) -> tuple[bool, str]:
 
 async def _click_handler(args: dict[str, Any], ctx: ToolContext) -> ContentResult:
     """Click on an element by UID."""
-    uid = args.get("uid") or args.get("selector")  # Legacy support
+    uid = args.get("uid")
 
     if not uid:
-        return [TextContent(type="text", text="Error: uid is required")]
+        return [
+            TextContent(
+                type="text",
+                text="Error: uid is required. Call take_snapshot first to get element UIDs.",
+            )
+        ]
 
     dbl_click = args.get("dblClick", False)
     success, message = await click_element(ctx, uid, double_click=dbl_click)
 
-    return [TextContent(type="text", text=message if success else f"Error: {message}")]
+    result: ContentResult = [
+        TextContent(type="text", text=message if success else f"Error: {message}")
+    ]
+    return await maybe_include_snapshot(args, ctx, result)
 
 
 click = register_tool(
     ToolDefinition(
         name="click",
-        description="Click on an element. Use UID from take_snapshot or CSS selector.",
+        description=(
+            "Click on an element identified by its uid from take_snapshot. "
+            "You MUST call take_snapshot first to obtain element UIDs. "
+            "Set includeSnapshot=true to get an updated snapshot after clicking."
+        ),
         category=ToolCategory.INPUT,
         read_only=False,
         required=["uid"],
@@ -287,10 +366,6 @@ click = register_tool(
                 "default": False,
             },
             **INCLUDE_SNAPSHOT_SCHEMA,
-            "selector": {
-                "type": "string",
-                "description": "(Deprecated) CSS selector. Use 'uid' instead.",
-            },
         },
         handler=_click_handler,
     )
@@ -299,22 +374,34 @@ click = register_tool(
 
 async def _fill_handler(args: dict[str, Any], ctx: ToolContext) -> ContentResult:
     """Fill text into an input element."""
-    uid = args.get("uid") or args.get("selector")
-    value = args.get("value") or args.get("text", "")
+    uid = args.get("uid")
+    value = args.get("value", "")
 
     if not uid:
-        return [TextContent(type="text", text="Error: uid is required")]
+        return [
+            TextContent(
+                type="text",
+                text="Error: uid is required. Call take_snapshot first to get element UIDs.",
+            )
+        ]
 
     clear_first = args.get("clear_first", True)
     success, message = await fill_element(ctx, uid, value, clear_first=clear_first)
 
-    return [TextContent(type="text", text=message if success else f"Error: {message}")]
+    result: ContentResult = [
+        TextContent(type="text", text=message if success else f"Error: {message}")
+    ]
+    return await maybe_include_snapshot(args, ctx, result)
 
 
 fill = register_tool(
     ToolDefinition(
         name="fill",
-        description="Type text into an input, text area, or select from a <select>.",
+        description=(
+            "Type text into an input, text area, or select. "
+            "Requires uid from take_snapshot. "
+            "Set includeSnapshot=true to get an updated snapshot after filling."
+        ),
         category=ToolCategory.INPUT,
         read_only=False,
         required=["uid", "value"],
@@ -330,14 +417,6 @@ fill = register_tool(
                 "default": True,
             },
             **INCLUDE_SNAPSHOT_SCHEMA,
-            "selector": {
-                "type": "string",
-                "description": "(Deprecated) CSS selector. Use 'uid' instead.",
-            },
-            "text": {
-                "type": "string",
-                "description": "(Deprecated) Text to type. Use 'value' instead.",
-            },
         },
         handler=_fill_handler,
     )
@@ -348,16 +427,27 @@ async def _hover_handler(args: dict[str, Any], ctx: ToolContext) -> ContentResul
     """Hover over an element."""
     uid = args.get("uid")
     if not uid:
-        return [TextContent(type="text", text="Error: uid is required")]
+        return [
+            TextContent(
+                type="text",
+                text="Error: uid is required. Call take_snapshot first to get element UIDs.",
+            )
+        ]
 
     success, message = await hover_element(ctx, uid)
-    return [TextContent(type="text", text=message if success else f"Error: {message}")]
+    result: ContentResult = [
+        TextContent(type="text", text=message if success else f"Error: {message}")
+    ]
+    return await maybe_include_snapshot(args, ctx, result)
 
 
 hover = register_tool(
     ToolDefinition(
         name="hover",
-        description="Hover over an element.",
+        description=(
+            "Hover over an element identified by uid from take_snapshot. "
+            "Set includeSnapshot=true to get an updated snapshot after hovering."
+        ),
         category=ToolCategory.INPUT,
         read_only=False,
         required=["uid"],
@@ -406,7 +496,8 @@ async def _press_key_handler(args: dict[str, Any], ctx: ToolContext) -> ContentR
                 {"type": "keyUp", "key": modifier},
             )
 
-        return [TextContent(type="text", text=f"Successfully pressed key: {key}")]
+        result: ContentResult = [TextContent(type="text", text=f"Successfully pressed key: {key}")]
+        return await maybe_include_snapshot(args, ctx, result)
 
     except Exception as e:
         return [TextContent(type="text", text=f"Error pressing key: {e}")]
@@ -415,7 +506,10 @@ async def _press_key_handler(args: dict[str, Any], ctx: ToolContext) -> ContentR
 press_key = register_tool(
     ToolDefinition(
         name="press_key",
-        description="Press a key or key combination (e.g., 'Enter', 'Control+A').",
+        description=(
+            "Press a key or key combination (e.g., 'Enter', 'Control+A'). "
+            "Set includeSnapshot=true to get an updated snapshot after the key press."
+        ),
         category=ToolCategory.INPUT,
         read_only=False,
         required=["key"],
@@ -478,7 +572,8 @@ async def _drag_handler(args: dict[str, Any], ctx: ToolContext) -> ContentResult
             {"type": "mouseReleased", "x": to_x, "y": to_y, "button": "left"},
         )
 
-        return [TextContent(type="text", text=f"Dragged {from_uid} onto {to_uid}")]
+        result: ContentResult = [TextContent(type="text", text=f"Dragged {from_uid} onto {to_uid}")]
+        return await maybe_include_snapshot(args, ctx, result)
 
     except Exception as e:
         return [TextContent(type="text", text=f"Error dragging: {e}")]
@@ -487,7 +582,11 @@ async def _drag_handler(args: dict[str, Any], ctx: ToolContext) -> ContentResult
 drag = register_tool(
     ToolDefinition(
         name="drag",
-        description="Drag an element onto another element.",
+        description=(
+            "Drag an element onto another element. Both from_uid and to_uid "
+            "must come from take_snapshot. "
+            "Set includeSnapshot=true to get an updated snapshot after dragging."
+        ),
         category=ToolCategory.INPUT,
         read_only=False,
         required=["from_uid", "to_uid"],
@@ -526,15 +625,20 @@ async def _fill_form_handler(args: dict[str, Any], ctx: ToolContext) -> ContentR
         success, message = await fill_element(ctx, uid, value)
         results.append(f"uid={uid}: {'OK' if success else message}")
 
-    return [
+    result: ContentResult = [
         TextContent(type="text", text=f"Filled {len(elements)} elements:\n" + "\n".join(results))
     ]
+    return await maybe_include_snapshot(args, ctx, result)
 
 
 fill_form = register_tool(
     ToolDefinition(
         name="fill_form",
-        description="Fill out multiple form elements at once.",
+        description=(
+            "Fill out multiple form elements at once. "
+            "All UIDs must come from take_snapshot. "
+            "Set includeSnapshot=true to get an updated snapshot after filling."
+        ),
         category=ToolCategory.INPUT,
         read_only=False,
         required=["elements"],
@@ -604,7 +708,10 @@ async def _upload_file_handler(args: dict[str, Any], ctx: ToolContext) -> Conten
 upload_file = register_tool(
     ToolDefinition(
         name="upload_file",
-        description="Upload a file through a provided element.",
+        description=(
+            "Upload a file through a file input element identified by uid from take_snapshot. "
+            "Set includeSnapshot=true to get an updated snapshot after uploading."
+        ),
         category=ToolCategory.INPUT,
         read_only=False,
         required=["uid", "filePath"],
@@ -644,7 +751,8 @@ async def _click_at_handler(args: dict[str, Any], ctx: ToolContext) -> ContentRe
         )
 
         action = "Double clicked" if dbl_click else "Clicked"
-        return [TextContent(type="text", text=f"{action} at ({x}, {y})")]
+        result: ContentResult = [TextContent(type="text", text=f"{action} at ({x}, {y})")]
+        return await maybe_include_snapshot(args, ctx, result)
 
     except Exception as e:
         return [TextContent(type="text", text=f"Error clicking at coordinates: {e}")]
@@ -653,7 +761,10 @@ async def _click_at_handler(args: dict[str, Any], ctx: ToolContext) -> ContentRe
 click_at = register_tool(
     ToolDefinition(
         name="click_at",
-        description="Click at the provided coordinates.",
+        description=(
+            "Click at specific x,y coordinates. Prefer using click with uid instead. "
+            "Set includeSnapshot=true to get an updated snapshot after clicking."
+        ),
         category=ToolCategory.INPUT,
         read_only=False,
         required=["x", "y"],
