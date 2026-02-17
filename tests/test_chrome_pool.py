@@ -254,10 +254,7 @@ class TestChromePoolManagerSessions:
         manager._instances = {"ses_1": instance1, "ses_2": instance2}
         manager._used_ports = {9222, 9223}
 
-        with (
-            patch.object(manager, "_kill_chrome", new_callable=AsyncMock),
-            patch.object(manager._forwarder_manager, "cleanup_all", new_callable=AsyncMock),
-        ):
+        with patch.object(manager, "_kill_chrome", new_callable=AsyncMock):
             await manager.cleanup_all()
 
         assert len(manager._instances) == 0

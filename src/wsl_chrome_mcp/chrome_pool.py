@@ -17,7 +17,6 @@ from typing import Any
 from .cdp_proxy import CDPProxyClient
 from .persistent_cdp import PersistentCDPClient, enable_domains
 from .ps_relay import PowerShellCDPRelay
-from .tunnel import PortForwarderManager, WindowsPortForwarder
 from .wsl import get_windows_host_ip, is_mirrored_networking, is_wsl, run_windows_command
 
 logger = logging.getLogger(__name__)
@@ -73,7 +72,6 @@ class ChromeInstance:
     created_at: datetime = field(default_factory=datetime.now)
 
     # Connection components
-    forwarder: WindowsPortForwarder | None = None
     cdp: PersistentCDPClient | None = None  # For current page
     browser_cdp: PersistentCDPClient | None = None  # For browser-level commands
     proxy: CDPProxyClient | None = None  # Fallback for one-shot commands
@@ -164,7 +162,6 @@ class ChromePoolManager:
         self._used_ports: set[int] = set()
         self._headless = headless
         self._chrome_path: str | None = None
-        self._forwarder_manager = PortForwarderManager()
         self._direct_tcp_works: bool = True
 
         self._cleanup_orphaned_temp_dirs()
@@ -553,33 +550,12 @@ class ChromePoolManager:
         else:
             initial_target_id = page_targets[0].get("id")
 
-        # Set up port forwarder for persistent connection (WSL only)
-        # Forwarder failure is non-fatal: we fall back to proxy-only mode
-        forwarder: WindowsPortForwarder | None = None
-        if is_wsl():
-            try:
-                forwarder = await self._forwarder_manager.get_or_create(port)
-                logger.info(
-                    "Forwarder established: %s:%d -> 127.0.0.1:%d",
-                    forwarder.windows_host,
-                    forwarder.listen_port,
-                    port,
-                )
-            except Exception as e:
-                logger.warning(
-                    "Forwarder setup failed for port %d, using proxy-only mode: %s",
-                    port,
-                    e,
-                )
-                forwarder = None
-
         assert user_data_dir is not None
         instance = ChromeInstance(
             session_id=session_id,
             port=port,
             pid=pid,
             user_data_dir=user_data_dir,
-            forwarder=forwarder,
             proxy=proxy,
             current_target_id=initial_target_id,
             targets=[initial_target_id] if initial_target_id else [],
@@ -630,10 +606,6 @@ class ChromePoolManager:
         """
         # Disconnect CDP first
         await self._disconnect_cdp(instance)
-
-        # Stop forwarder
-        if instance.forwarder:
-            await self._forwarder_manager.remove(instance.port)
 
         if instance.pid:
             logger.info(
@@ -712,8 +684,6 @@ class ChromePoolManager:
                 await self.destroy(session_id)
             except Exception as e:
                 logger.warning("Error destroying session %s: %s", session_id, e)
-
-        await self._forwarder_manager.cleanup_all()
 
     def list_sessions(self) -> dict[str, dict[str, Any]]:
         """List all active sessions.
