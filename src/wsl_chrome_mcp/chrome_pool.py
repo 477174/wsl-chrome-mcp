@@ -16,6 +16,7 @@ from typing import Any
 
 from .cdp_proxy import CDPProxyClient
 from .persistent_cdp import PersistentCDPClient, enable_domains
+from .ps_relay import PowerShellCDPRelay
 from .tunnel import PortForwarderManager, WindowsPortForwarder
 from .wsl import get_windows_host_ip, is_wsl, run_windows_command
 
@@ -363,14 +364,14 @@ class ChromePoolManager:
     async def _connect_cdp(self, instance: ChromeInstance, target_id: str) -> None:
         """Establish persistent CDP connection for a target.
 
-        In WSL, rewrites the WebSocket URL to use the Windows host IP
-        so PersistentCDPClient can connect directly from WSL2.
+        Tries multiple WebSocket URLs in order:
+        1. Original URL (localhost — works via WSL2 localhostForwarding)
+        2. Rewritten URL with Windows host IP (fallback)
 
         Raises:
             RuntimeError: If no connection method is available.
-            ConnectionError: If WebSocket connection fails.
+            ConnectionError: If all connection attempts fail.
         """
-        # Get target info to find WebSocket URL
         if not instance.proxy:
             raise RuntimeError("No proxy available to discover targets")
 
@@ -383,42 +384,77 @@ class ChromePoolManager:
         if not original_ws_url:
             raise RuntimeError(f"No WebSocket URL for target {target_id}")
 
+        if instance.cdp and instance.cdp.is_connected:
+            await instance.cdp.disconnect()
+
+        candidate_urls = self._build_ws_candidates(original_ws_url)
+        last_error: Exception | None = None
+
+        for ws_url in candidate_urls:
+            try:
+                logger.debug("Trying direct CDP connection: %s", ws_url)
+                client = PersistentCDPClient(ws_url, timeout=5.0)
+                await client.connect()
+                instance.cdp = client
+                await enable_domains(instance.cdp, ["Page", "Runtime", "Network", "DOM"])
+                self._setup_event_handlers(instance)
+                logger.info(
+                    "Session %s: CDP connected to target %s via %s",
+                    instance.session_id,
+                    target_id,
+                    ws_url,
+                )
+                return
+            except Exception as e:
+                logger.debug("Direct CDP failed for %s: %s", ws_url, e)
+                last_error = e
+
+        # WSL2 fallback: PowerShell stdin/stdout relay bypasses TCP restrictions
+        if is_wsl():
+            try:
+                logger.info("Trying PowerShell CDP relay for %s", original_ws_url)
+                relay = PowerShellCDPRelay(original_ws_url)
+                await relay.connect()
+                instance.cdp = relay  # type: ignore[assignment]
+                await enable_domains(relay, ["Page", "Runtime", "Network", "DOM"])
+                self._setup_event_handlers(instance)
+                logger.info(
+                    "Session %s: CDP connected via PowerShell relay to target %s",
+                    instance.session_id,
+                    target_id,
+                )
+                return
+            except Exception as e:
+                logger.warning("PowerShell CDP relay failed: %s", e)
+                last_error = e
+
+        raise ConnectionError(
+            f"All CDP connection attempts failed for target {target_id}: {last_error}"
+        )
+
+    @staticmethod
+    def _build_ws_candidates(original_ws_url: str) -> list[str]:
+        """Build ordered list of WebSocket URLs to try.
+
+        Non-WSL: just the original URL.
+        WSL: localhost first (localhostForwarding), then Windows host IP.
+        """
         if not is_wsl():
-            ws_url = original_ws_url
-            logger.debug("Connecting CDP directly: %s", ws_url)
-        else:
-            # WSL2→Windows: rewrite localhost to Windows host IP
-            # (Chrome listens on 0.0.0.0 via --remote-debugging-address)
-            windows_host = get_windows_host_ip()
-            ws_url = re.sub(
+            return [original_ws_url]
+
+        candidates = [original_ws_url]
+
+        windows_host = get_windows_host_ip()
+        if windows_host not in ("127.0.0.1", "localhost"):
+            rewritten = re.sub(
                 r"ws://(127\.0\.0\.1|localhost)(:\d+)",
                 f"ws://{windows_host}\\2",
                 original_ws_url,
             )
-            logger.debug(
-                "Connecting CDP from WSL2 via Windows host: %s (host IP: %s)",
-                ws_url,
-                windows_host,
-            )
+            if rewritten != original_ws_url:
+                candidates.append(rewritten)
 
-        # Disconnect previous CDP client if any
-        if instance.cdp and instance.cdp.is_connected:
-            await instance.cdp.disconnect()
-
-        instance.cdp = PersistentCDPClient(ws_url)
-        await instance.cdp.connect()
-
-        # Enable CDP domains for event collection
-        await enable_domains(instance.cdp, ["Page", "Runtime", "Network", "DOM"])
-
-        # Set up event handlers
-        self._setup_event_handlers(instance)
-
-        logger.info(
-            "Session %s: CDP connected to target %s",
-            instance.session_id,
-            target_id,
-        )
+        return candidates
 
     async def _launch_chrome(self, session_id: str, port: int) -> ChromeInstance:
         """Launch a new Chrome instance on Windows with persistent connection.
@@ -626,36 +662,10 @@ class ChromePoolManager:
             instance = self._instances[session_id]
             logger.debug("Returning existing Chrome for session %s", session_id)
 
-            # Check if persistent CDP connection is still alive
             if not instance.is_connected and instance.current_target_id:
                 logger.info("Reconnecting CDP for session %s", session_id)
                 try:
-                    # If forwarder exists but seems broken, recreate it
-                    if instance.forwarder and not instance.forwarder.is_running:
-                        logger.info(
-                            "Forwarder died for session %s, recreating",
-                            session_id,
-                        )
-                        try:
-                            instance.forwarder = await self._forwarder_manager.get_or_create(
-                                instance.port, verify=True
-                            )
-                        except Exception as te:
-                            logger.warning(
-                                "Forwarder recreation failed for session %s: %s",
-                                session_id,
-                                te,
-                            )
-                            instance.forwarder = None
-
-                    # Only attempt CDP reconnect if we have a forwarder (WSL) or not in WSL
-                    if instance.forwarder or not is_wsl():
-                        await self._connect_cdp(instance, instance.current_target_id)
-                    else:
-                        logger.debug(
-                            "Skipping CDP reconnect for session %s (no forwarder, proxy-only)",
-                            session_id,
-                        )
+                    await self._connect_cdp(instance, instance.current_target_id)
                 except Exception as e:
                     logger.warning("Failed to reconnect CDP: %s", e)
 

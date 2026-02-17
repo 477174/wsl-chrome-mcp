@@ -13,7 +13,7 @@ import json
 import logging
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Protocol, runtime_checkable
 
 import httpx
 import websockets
@@ -23,6 +23,29 @@ logger = logging.getLogger(__name__)
 
 # Type alias for event handlers
 EventHandler = Callable[[dict[str, Any]], Awaitable[None] | None]
+
+
+@runtime_checkable
+class CDPClientProtocol(Protocol):
+    """Minimal interface shared by PersistentCDPClient and PowerShellCDPRelay."""
+
+    @property
+    def is_connected(self) -> bool: ...
+
+    async def send(
+        self,
+        method: str,
+        params: dict[str, Any] | None = ...,
+        timeout: float | None = ...,
+    ) -> dict[str, Any]: ...
+
+    async def connect(self) -> None: ...
+
+    async def disconnect(self) -> None: ...
+
+    def on(self, event: str, handler: EventHandler) -> None: ...
+
+    def off(self, event: str, handler: EventHandler | None = ...) -> None: ...
 
 
 class CDPError(Exception):
@@ -464,7 +487,7 @@ class CDPConnection:
 
 
 async def enable_domains(
-    client: PersistentCDPClient,
+    client: CDPClientProtocol,
     domains: list[str] | None = None,
 ) -> None:
     """Enable common CDP domains for event collection.
