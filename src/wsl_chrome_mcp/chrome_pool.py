@@ -18,7 +18,7 @@ from .cdp_proxy import CDPProxyClient
 from .persistent_cdp import PersistentCDPClient, enable_domains
 from .ps_relay import PowerShellCDPRelay
 from .tunnel import PortForwarderManager, WindowsPortForwarder
-from .wsl import get_windows_host_ip, is_wsl, run_windows_command
+from .wsl import get_windows_host_ip, is_mirrored_networking, is_wsl, run_windows_command
 
 logger = logging.getLogger(__name__)
 
@@ -441,9 +441,13 @@ class ChromePoolManager:
         """Build ordered list of WebSocket URLs to try.
 
         Non-WSL: just the original URL.
-        WSL: localhost first (localhostForwarding), then Windows host IP.
+        WSL mirrored: localhost only (shares Windows network stack).
+        WSL NAT: localhost first, then Windows host IP.
         """
         if not is_wsl():
+            return [original_ws_url]
+
+        if is_mirrored_networking():
             return [original_ws_url]
 
         candidates = [original_ws_url]

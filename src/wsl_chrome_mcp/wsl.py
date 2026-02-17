@@ -29,6 +29,41 @@ def is_wsl() -> bool:
 
 
 @lru_cache(maxsize=1)
+def is_mirrored_networking() -> bool:
+    """Detect WSL2 mirrored networking mode.
+
+    When networkingMode=mirrored is set in .wslconfig, WSL2 shares the Windows
+    network stack and localhost points directly to Windows services.
+    """
+    if not is_wsl():
+        return False
+
+    for user_dir in Path("/mnt/c/Users").iterdir():
+        if not user_dir.is_dir() or user_dir.name in (
+            "Public",
+            "Default",
+            "Default User",
+            "All Users",
+        ):
+            continue
+        wslconfig = user_dir / ".wslconfig"
+        if not wslconfig.exists():
+            continue
+        try:
+            text = wslconfig.read_text(encoding="utf-8", errors="replace").lower()
+            for line in text.splitlines():
+                stripped = line.strip()
+                if stripped.startswith("#"):
+                    continue
+                if "networkingmode" in stripped and "mirrored" in stripped:
+                    return True
+        except OSError:
+            continue
+
+    return False
+
+
+@lru_cache(maxsize=1)
 def get_windows_host_ip() -> str:
     """Get the IP address of the Windows host from WSL.
 
@@ -206,9 +241,7 @@ def run_windows_command(command: str, *, timeout: float = 30.0) -> subprocess.Co
     # Decode with error handling for non-UTF-8 output
     stdout = result.stdout.decode("utf-8", errors="replace") if result.stdout else ""
     stderr = result.stderr.decode("utf-8", errors="replace") if result.stderr else ""
-    return subprocess.CompletedProcess(
-        result.args, result.returncode, stdout, stderr
-    )
+    return subprocess.CompletedProcess(result.args, result.returncode, stdout, stderr)
 
 
 def get_windows_chrome_paths() -> list[str]:
