@@ -165,6 +165,7 @@ class ChromePoolManager:
         self._headless = headless
         self._chrome_path: str | None = None
         self._forwarder_manager = PortForwarderManager()
+        self._direct_tcp_works: bool = True
 
         self._cleanup_orphaned_temp_dirs()
 
@@ -387,29 +388,32 @@ class ChromePoolManager:
         if instance.cdp and instance.cdp.is_connected:
             await instance.cdp.disconnect()
 
-        candidate_urls = self._build_ws_candidates(original_ws_url)
         last_error: Exception | None = None
 
-        for ws_url in candidate_urls:
-            try:
-                logger.debug("Trying direct CDP connection: %s", ws_url)
-                client = PersistentCDPClient(ws_url, timeout=5.0)
-                await client.connect()
-                instance.cdp = client
-                await enable_domains(instance.cdp, ["Page", "Runtime", "Network", "DOM"])
-                self._setup_event_handlers(instance)
-                logger.info(
-                    "Session %s: CDP connected to target %s via %s",
-                    instance.session_id,
-                    target_id,
-                    ws_url,
-                )
-                return
-            except Exception as e:
-                logger.debug("Direct CDP failed for %s: %s", ws_url, e)
-                last_error = e
+        if self._direct_tcp_works:
+            candidate_urls = self._build_ws_candidates(original_ws_url)
+            for ws_url in candidate_urls:
+                try:
+                    logger.debug("Trying direct CDP connection: %s", ws_url)
+                    client = PersistentCDPClient(ws_url, timeout=5.0)
+                    await client.connect()
+                    instance.cdp = client
+                    await enable_domains(instance.cdp, ["Page", "Runtime", "Network", "DOM"])
+                    self._setup_event_handlers(instance)
+                    logger.info(
+                        "Session %s: CDP connected to target %s via %s",
+                        instance.session_id,
+                        target_id,
+                        ws_url,
+                    )
+                    return
+                except Exception as e:
+                    logger.debug("Direct CDP failed for %s: %s", ws_url, e)
+                    last_error = e
 
-        # WSL2 fallback: PowerShell stdin/stdout relay bypasses TCP restrictions
+            self._direct_tcp_works = False
+            logger.info("Direct TCP connections failed; future attempts will use relay directly")
+
         if is_wsl():
             try:
                 logger.info("Trying PowerShell CDP relay for %s", original_ws_url)

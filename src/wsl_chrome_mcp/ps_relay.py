@@ -176,6 +176,12 @@ class PowerShellCDPRelay:
 
         logger.debug("Starting PowerShell CDP relay for %s", self.ws_url)
 
+        # Use 16MB buffer limit to handle large CDP messages (accessibility
+        # trees, full-page DOM snapshots, etc.).  The asyncio default is 64KB
+        # which causes "Separator is not found, and chunk exceed the limit"
+        # errors on content-heavy pages like google.com.
+        buf_limit = 16 * 1024 * 1024  # 16 MB
+
         self._process = await asyncio.create_subprocess_exec(
             powershell,
             "-NoProfile",
@@ -187,6 +193,7 @@ class PowerShellCDPRelay:
             stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
+            limit=buf_limit,
         )
 
         try:
