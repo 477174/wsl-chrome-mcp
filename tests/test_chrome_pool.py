@@ -1,4 +1,4 @@
-"""Tests for ChromePoolManager - per-session Chrome instance management."""
+"""Tests for ChromePoolManager - shared Chrome with per-session browser contexts."""
 
 from __future__ import annotations
 
@@ -55,6 +55,7 @@ def make_chrome_instance(
     session_id: str = "test_session",
     port: int = 9222,
     pid: int = 1234,
+    browser_context_id: str | None = "ctx_test",
 ) -> ChromeInstance:
     """Create a ChromeInstance for testing."""
     proxy = make_mock_proxy(port)
@@ -67,7 +68,17 @@ def make_chrome_instance(
         created_at=datetime.now(),
         current_target_id="T1",
         targets=["T1"],
+        browser_context_id=browser_context_id,
     )
+
+
+def _make_mock_browser_cdp() -> MagicMock:
+    """Create a mock browser-level CDP client."""
+    cdp = MagicMock()
+    cdp.is_connected = True
+    cdp.send = AsyncMock()
+    cdp.disconnect = AsyncMock()
+    return cdp
 
 
 # --- ChromeInstance Tests ---
@@ -102,100 +113,22 @@ class TestChromeInstance:
         assert len(instance.network_requests) == 0
         assert len(instance.snapshot_cache) == 0
 
+    def test_browser_context_id_stored(self) -> None:
+        """Should store browser_context_id."""
+        instance = make_chrome_instance(browser_context_id="ctx_abc")
+        assert instance.browser_context_id == "ctx_abc"
 
-# --- ChromePoolManager Port Allocation Tests ---
-
-
-class TestChromePoolManagerPorts:
-    """Tests for port allocation."""
-
-    def test_is_port_in_use_returns_true_when_responding(self) -> None:
-        """Should return True when port responds to HTTP request."""
-        manager = _make_manager(port_min=9222, port_max=9225)
-
-        with patch("wsl_chrome_mcp.chrome_pool.CDPProxyClient") as mock_client_class:
-            mock_client = MagicMock()
-            mock_client._make_http_request.return_value = {"Browser": "Chrome"}
-            mock_client_class.return_value = mock_client
-
-            assert manager._is_port_in_use(9222) is True
-            mock_client._make_http_request.assert_called_once_with("/json/version")
-
-    def test_is_port_in_use_returns_false_when_not_responding(self) -> None:
-        """Should return False when port doesn't respond."""
-        manager = _make_manager(port_min=9222, port_max=9225)
-
-        with patch("wsl_chrome_mcp.chrome_pool.CDPProxyClient") as mock_client_class:
-            mock_client = MagicMock()
-            mock_client._make_http_request.return_value = None
-            mock_client_class.return_value = mock_client
-
-            assert manager._is_port_in_use(9222) is False
-
-    def test_is_port_in_use_returns_false_on_exception(self) -> None:
-        """Should return False when request raises exception."""
-        manager = _make_manager(port_min=9222, port_max=9225)
-
-        with patch("wsl_chrome_mcp.chrome_pool.CDPProxyClient") as mock_client_class:
-            mock_client = MagicMock()
-            mock_client._make_http_request.side_effect = Exception("Connection refused")
-            mock_client_class.return_value = mock_client
-
-            assert manager._is_port_in_use(9222) is False
-
-    def test_allocate_port_returns_first_available(self) -> None:
-        """Should return first port in range."""
-        manager = _make_manager(port_min=9222, port_max=9225)
-
-        with patch.object(manager, "_is_port_in_use", return_value=False):
-            port = manager._allocate_port()
-            assert port == 9222
-
-    def test_allocate_port_skips_used_ports(self) -> None:
-        """Should skip already used ports."""
-        manager = _make_manager(port_min=9222, port_max=9225)
-        manager._used_ports.add(9222)
-        manager._used_ports.add(9223)
-
-        with patch.object(manager, "_is_port_in_use", return_value=False):
-            port = manager._allocate_port()
-            assert port == 9224
-
-    def test_allocate_port_skips_externally_used_ports(self) -> None:
-        """Should skip ports that are externally in use (orphaned Chrome)."""
-        manager = _make_manager(port_min=9222, port_max=9225)
-
-        # Mock: 9222 and 9223 are externally in use, 9224 is free
-        def mock_is_port_in_use(port: int) -> bool:
-            return port in (9222, 9223)
-
-        with patch.object(manager, "_is_port_in_use", side_effect=mock_is_port_in_use):
-            port = manager._allocate_port()
-            assert port == 9224
-            # Externally used ports should be added to _used_ports
-            assert 9222 in manager._used_ports
-            assert 9223 in manager._used_ports
-
-    def test_allocate_port_raises_when_exhausted(self) -> None:
-        """Should raise when no ports available."""
-        manager = _make_manager(port_min=9222, port_max=9224)
-        manager._used_ports = {9222, 9223}
-        with pytest.raises(RuntimeError, match="No available ports"):
-            manager._allocate_port()
-
-    def test_release_port_makes_port_available(self) -> None:
-        """Should return port to available pool."""
-        manager = _make_manager(port_min=9222, port_max=9225)
-        manager._used_ports.add(9222)
-        manager._release_port(9222)
-        assert 9222 not in manager._used_ports
+    def test_browser_context_id_defaults_none(self) -> None:
+        """Should default to None when not provided."""
+        instance = make_chrome_instance(browser_context_id=None)
+        assert instance.browser_context_id is None
 
 
 # --- ChromePoolManager Session Tests ---
 
 
 class TestChromePoolManagerSessions:
-    """Tests for session management."""
+    """Tests for session management with browser contexts."""
 
     @pytest.mark.asyncio
     async def test_get_or_create_returns_existing(self) -> None:
@@ -203,25 +136,59 @@ class TestChromePoolManagerSessions:
         manager = _make_manager()
         instance = make_chrome_instance("ses_abc", port=9222)
         manager._instances["ses_abc"] = instance
-        manager._used_ports.add(9222)
 
         result = await manager.get_or_create("ses_abc")
 
         assert result is instance
 
     @pytest.mark.asyncio
-    async def test_destroy_removes_instance(self) -> None:
-        """Should remove instance and release port."""
+    async def test_get_or_create_new_session(self) -> None:
+        """Should create browser context and target for new session."""
         manager = _make_manager()
-        instance = make_chrome_instance("ses_abc", port=9222)
-        manager._instances["ses_abc"] = instance
-        manager._used_ports.add(9222)
 
-        with patch.object(manager, "_kill_chrome", new_callable=AsyncMock):
-            await manager.destroy("ses_abc")
+        # Set up shared Chrome state
+        mock_browser_cdp = _make_mock_browser_cdp()
+        mock_browser_cdp.send = AsyncMock(
+            side_effect=[
+                # Target.createBrowserContext
+                {"browserContextId": "ctx_new"},
+                # Target.createTarget
+                {"targetId": "T_new"},
+            ]
+        )
+        manager._browser_cdp = mock_browser_cdp
+        manager._shared_proxy = make_mock_proxy()
+        manager._shared_pid = 9999
+
+        with (
+            patch.object(manager, "_ensure_shared_chrome", new_callable=AsyncMock),
+            patch.object(manager, "_connect_cdp", new_callable=AsyncMock),
+        ):
+            result = await manager.get_or_create("ses_new")
+
+        assert result.session_id == "ses_new"
+        assert result.browser_context_id == "ctx_new"
+        assert result.current_target_id == "T_new"
+        assert "T_new" in result.targets
+        assert "ses_new" in manager._instances
+
+    @pytest.mark.asyncio
+    async def test_destroy_removes_instance(self) -> None:
+        """Should remove instance and dispose browser context."""
+        manager = _make_manager()
+        instance = make_chrome_instance("ses_abc", port=9222, browser_context_id="ctx_abc")
+        manager._instances["ses_abc"] = instance
+
+        mock_browser_cdp = _make_mock_browser_cdp()
+        manager._browser_cdp = mock_browser_cdp
+
+        await manager.destroy("ses_abc")
 
         assert "ses_abc" not in manager._instances
-        assert 9222 not in manager._used_ports
+        mock_browser_cdp.send.assert_called_once_with(
+            "Target.disposeBrowserContext",
+            {"browserContextId": "ctx_abc"},
+        )
 
     @pytest.mark.asyncio
     async def test_destroy_unknown_raises(self) -> None:
@@ -232,9 +199,11 @@ class TestChromePoolManagerSessions:
             await manager.destroy("nonexistent")
 
     def test_list_sessions_returns_info(self) -> None:
-        """Should return session info."""
+        """Should return session info including browser_context_id."""
         manager = _make_manager()
-        instance = make_chrome_instance("ses_abc", port=9222, pid=1234)
+        instance = make_chrome_instance(
+            "ses_abc", port=9222, pid=1234, browser_context_id="ctx_abc"
+        )
         manager._instances["ses_abc"] = instance
 
         sessions = manager.list_sessions()
@@ -244,21 +213,51 @@ class TestChromePoolManagerSessions:
         assert sessions["ses_abc"]["pid"] == 1234
         assert sessions["ses_abc"]["tab_count"] == 1
         assert sessions["ses_abc"]["connected"] is False
+        assert sessions["ses_abc"]["browser_context_id"] == "ctx_abc"
 
     @pytest.mark.asyncio
     async def test_cleanup_all_destroys_all(self) -> None:
-        """Should destroy all instances."""
+        """Should destroy all instances and kill shared Chrome."""
         manager = _make_manager()
-        instance1 = make_chrome_instance("ses_1", port=9222)
-        instance2 = make_chrome_instance("ses_2", port=9223)
+        instance1 = make_chrome_instance("ses_1", port=9222, browser_context_id="ctx_1")
+        instance2 = make_chrome_instance("ses_2", port=9222, browser_context_id="ctx_2")
         manager._instances = {"ses_1": instance1, "ses_2": instance2}
-        manager._used_ports = {9222, 9223}
 
-        with patch.object(manager, "_kill_chrome", new_callable=AsyncMock):
+        mock_browser_cdp = _make_mock_browser_cdp()
+        manager._browser_cdp = mock_browser_cdp
+
+        with patch.object(manager, "_kill_shared_chrome", new_callable=AsyncMock):
             await manager.cleanup_all()
 
         assert len(manager._instances) == 0
-        assert len(manager._used_ports) == 0
+
+    @pytest.mark.asyncio
+    async def test_get_or_create_cleans_up_context_on_failure(self) -> None:
+        """Should dispose browser context if target creation fails."""
+        manager = _make_manager()
+
+        mock_browser_cdp = _make_mock_browser_cdp()
+        mock_browser_cdp.send = AsyncMock(
+            side_effect=[
+                # Target.createBrowserContext succeeds
+                {"browserContextId": "ctx_fail"},
+                # Target.createTarget fails
+                RuntimeError("Target creation failed"),
+            ]
+        )
+        manager._browser_cdp = mock_browser_cdp
+        manager._shared_proxy = make_mock_proxy()
+        manager._shared_pid = 9999
+
+        with (
+            patch.object(manager, "_ensure_shared_chrome", new_callable=AsyncMock),
+            pytest.raises(RuntimeError, match="Target creation failed"),
+        ):
+            await manager.get_or_create("ses_fail")
+
+        assert "ses_fail" not in manager._instances
+        # Should have attempted to dispose the browser context
+        assert mock_browser_cdp.send.call_count == 3  # create ctx + create target + dispose ctx
 
 
 # --- Tab Operations Tests ---
@@ -269,32 +268,23 @@ class TestChromePoolManagerTabs:
 
     @pytest.mark.asyncio
     async def test_create_tab_adds_to_instance(self) -> None:
-        """Should create tab and add to instance."""
+        """Should create tab via browser CDP and add to instance."""
         manager = _make_manager()
-        instance = make_chrome_instance("ses_abc")
+        instance = make_chrome_instance("ses_abc", browser_context_id="ctx_abc")
         manager._instances["ses_abc"] = instance
 
-        # Mock the target listing after creation
-        assert instance.proxy is not None
-        instance.proxy.list_targets = AsyncMock(
-            return_value=[
-                {
-                    "id": "T1",
-                    "type": "page",
-                    "url": "about:blank",
-                    "webSocketDebuggerUrl": "ws://...",
-                },
-                {
-                    "id": "T2",
-                    "type": "page",
-                    "url": "https://example.com",
-                    "webSocketDebuggerUrl": "ws://localhost:9222/devtools/page/T2",
-                },
+        mock_browser_cdp = _make_mock_browser_cdp()
+        mock_browser_cdp.send = AsyncMock(
+            side_effect=[
+                # Target.createTarget
+                {"targetId": "T2"},
+                # Target.activateTarget (from switch_tab)
+                {},
             ]
         )
+        manager._browser_cdp = mock_browser_cdp
 
-        # Mock switch_tab to avoid CDP connection
-        with patch.object(manager, "switch_tab", new_callable=AsyncMock):
+        with patch.object(manager, "_connect_cdp", new_callable=AsyncMock):
             target_id = await manager.create_tab("ses_abc", "https://example.com")
 
         assert target_id == "T2"
@@ -308,7 +298,10 @@ class TestChromePoolManagerTabs:
         instance.targets = ["T1", "T2"]
         manager._instances["ses_abc"] = instance
 
-        # Mock _connect_cdp to avoid actual connection
+        mock_browser_cdp = _make_mock_browser_cdp()
+        mock_browser_cdp.send = AsyncMock(return_value={})
+        manager._browser_cdp = mock_browser_cdp
+
         with patch.object(manager, "_connect_cdp", new_callable=AsyncMock):
             await manager.switch_tab("ses_abc", "T2")
 
@@ -333,7 +326,6 @@ class TestChromePoolManagerTabs:
         instance.current_target_id = "T2"
         manager._instances["ses_abc"] = instance
 
-        # Mock _connect_cdp to avoid actual connection
         with patch.object(manager, "_connect_cdp", new_callable=AsyncMock):
             await manager.close_tab("ses_abc", "T2")
 
@@ -376,28 +368,32 @@ class TestChromePoolManagerTabs:
 class TestChromePoolManagerIntegration:
     """Higher-level integration tests."""
 
-    def test_multiple_sessions_get_different_ports(self) -> None:
-        """Multiple sessions should have different ports."""
-        manager = _make_manager(port_min=9222, port_max=9230)
+    def test_multiple_sessions_share_port(self) -> None:
+        """All sessions should share the same port."""
+        manager = _make_manager()
 
-        inst1 = make_chrome_instance("ses_1", port=9222)
-        inst2 = make_chrome_instance("ses_2", port=9223)
-        inst3 = make_chrome_instance("ses_3", port=9224)
+        inst1 = make_chrome_instance("ses_1", port=9222, browser_context_id="ctx_1")
+        inst2 = make_chrome_instance("ses_2", port=9222, browser_context_id="ctx_2")
+        inst3 = make_chrome_instance("ses_3", port=9222, browser_context_id="ctx_3")
 
         manager._instances = {"ses_1": inst1, "ses_2": inst2, "ses_3": inst3}
-        manager._used_ports = {9222, 9223, 9224}
 
+        # All share port 9222
         ports = {inst.port for inst in manager._instances.values()}
-        assert len(ports) == 3  # All different
+        assert ports == {9222}
+
+        # But have different browser contexts
+        contexts = {inst.browser_context_id for inst in manager._instances.values()}
+        assert len(contexts) == 3
 
     def test_session_isolation(self) -> None:
         """Sessions should have independent tab tracking."""
         manager = _make_manager()
 
-        inst1 = make_chrome_instance("ses_1", port=9222)
+        inst1 = make_chrome_instance("ses_1", port=9222, browser_context_id="ctx_1")
         inst1.targets = ["A1", "A2"]
 
-        inst2 = make_chrome_instance("ses_2", port=9223)
+        inst2 = make_chrome_instance("ses_2", port=9222, browser_context_id="ctx_2")
         inst2.targets = ["B1"]
 
         manager._instances = {"ses_1": inst1, "ses_2": inst2}
@@ -411,11 +407,11 @@ class TestChromePoolManagerIntegration:
         assert "A3" not in inst2.targets
 
 
-# --- Profile Tests ---
+# --- Orphaned Temp Dir Cleanup Tests ---
 
 
-class TestChromePoolManagerProfile:
-    """Tests for Chrome profile copy functionality."""
+class TestChromePoolManagerCleanup:
+    """Tests for orphaned temp directory cleanup."""
 
     def _mock_run_windows(self, stdout: str = "", returncode: int = 0) -> MagicMock:
         """Create a mock for run_windows_command."""
@@ -424,108 +420,12 @@ class TestChromePoolManagerProfile:
         result.returncode = returncode
         return result
 
-    def test_init_reads_profile_from_env(self) -> None:
-        """Should read CHROME_MCP_PROFILE from environment."""
-        with patch.dict("os.environ", {"CHROME_MCP_PROFILE": "Profile 1"}):
-            manager = _make_manager()
-            assert manager._profile_name == "Profile 1"
-
-    def test_init_none_when_env_not_set(self) -> None:
-        """Should be None when env var is not set."""
-        with patch.dict("os.environ", {}, clear=True):
-            manager = _make_manager()
-            assert manager._profile_name is None
-
-    def test_init_none_when_env_is_empty(self) -> None:
-        """Should be None when env var is empty string."""
-        with patch.dict("os.environ", {"CHROME_MCP_PROFILE": ""}):
-            manager = _make_manager()
-            assert manager._profile_name is None
-
-    def test_profile_exists_returns_true(self) -> None:
-        """Should return True when profile directory exists."""
-        manager = _make_manager()
-
-        with patch("wsl_chrome_mcp.chrome_pool.run_windows_command") as mock_run:
-            # First call: _get_windows_chrome_user_data_dir
-            # Second call: profile existence check
-            mock_run.side_effect = [
-                self._mock_run_windows(
-                    "C:\\Users\\test\\AppData\\Local\\Google\\Chrome\\User Data"
-                ),
-                self._mock_run_windows("exists"),
-            ]
-            assert manager._profile_exists("Default") is True
-
-    def test_profile_exists_returns_false_when_not_found(self) -> None:
-        """Should return False when profile directory doesn't exist."""
-        manager = _make_manager()
-
-        with patch("wsl_chrome_mcp.chrome_pool.run_windows_command") as mock_run:
-            mock_run.side_effect = [
-                self._mock_run_windows(
-                    "C:\\Users\\test\\AppData\\Local\\Google\\Chrome\\User Data"
-                ),
-                self._mock_run_windows(""),  # Profile not found
-            ]
-            assert manager._profile_exists("NonExistent") is False
-
-    def test_profile_exists_returns_false_when_no_chrome_dir(self) -> None:
-        """Should return False when Chrome user data dir doesn't exist."""
-        manager = _make_manager()
-
-        with patch("wsl_chrome_mcp.chrome_pool.run_windows_command") as mock_run:
-            mock_run.return_value = self._mock_run_windows("")
-            assert manager._profile_exists("Default") is False
-
-    def test_copy_profile_to_temp_succeeds(self) -> None:
-        """Should copy profile and return True on success."""
-        manager = _make_manager()
-
-        with patch("wsl_chrome_mcp.chrome_pool.run_windows_command") as mock_run:
-            mock_run.side_effect = [
-                # _get_windows_chrome_user_data_dir
-                self._mock_run_windows(
-                    "C:\\Users\\test\\AppData\\Local\\Google\\Chrome\\User Data"
-                ),
-                # Copy-Item command
-                self._mock_run_windows("done"),
-            ]
-            result = manager._copy_profile_to_temp("Default", "C:\\Temp\\chrome-mcp-abc")
-            assert result is True
-
-    def test_copy_profile_to_temp_fails_gracefully(self) -> None:
-        """Should return False when copy fails."""
-        manager = _make_manager()
-
-        with patch("wsl_chrome_mcp.chrome_pool.run_windows_command") as mock_run:
-            mock_run.side_effect = [
-                self._mock_run_windows(
-                    "C:\\Users\\test\\AppData\\Local\\Google\\Chrome\\User Data"
-                ),
-                self._mock_run_windows("", returncode=1),  # Copy failed
-            ]
-            result = manager._copy_profile_to_temp("Default", "C:\\Temp\\chrome-mcp-abc")
-            assert result is False
-
-    def test_copy_profile_to_temp_fails_when_no_chrome_dir(self) -> None:
-        """Should return False when Chrome user data dir not found."""
-        manager = _make_manager()
-
-        with patch("wsl_chrome_mcp.chrome_pool.run_windows_command") as mock_run:
-            mock_run.return_value = self._mock_run_windows("")
-            result = manager._copy_profile_to_temp("Default", "C:\\Temp\\chrome-mcp-abc")
-            assert result is False
-
     def test_cleanup_orphaned_dirs_runs_powershell(self) -> None:
         """Should execute PowerShell to clean old chrome-mcp-* dirs."""
         with patch("wsl_chrome_mcp.chrome_pool.run_windows_command") as mock_run:
             mock_run.return_value = self._mock_run_windows("chrome-mcp-old1\nchrome-mcp-old2")
-            # Create manager without mocking cleanup
-            with patch.dict("os.environ", {}, clear=True):
-                ChromePoolManager()
+            ChromePoolManager()
 
-            # Verify cleanup was called
             assert mock_run.called
             call_args = mock_run.call_args_list[0][0][0]
             assert "chrome-mcp-*" in call_args
@@ -537,7 +437,5 @@ class TestChromePoolManagerProfile:
             "wsl_chrome_mcp.chrome_pool.run_windows_command",
             side_effect=Exception("PowerShell not available"),
         ):
-            # Should not raise
-            with patch.dict("os.environ", {}, clear=True):
-                manager = ChromePoolManager()
+            manager = ChromePoolManager()
             assert manager is not None

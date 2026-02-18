@@ -114,7 +114,7 @@ async def _session_end_handler(args: dict[str, Any], ctx: ToolContext) -> Conten
 chrome_session_end = register_tool(
     ToolDefinition(
         name="chrome_session_end",
-        description="End a session, killing its Chrome process.",
+        description="End a session, closing its browser context.",
         category=ToolCategory.NAVIGATION,
         read_only=False,
         required=["session_id"],
