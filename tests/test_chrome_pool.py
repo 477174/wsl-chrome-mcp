@@ -135,6 +135,7 @@ class TestChromePoolManagerSessions:
         """Should return cached instance on second call."""
         manager = _make_manager()
         instance = make_chrome_instance("ses_abc", port=9222)
+        instance.cdp = _make_mock_browser_cdp()
         manager._instances["ses_abc"] = instance
 
         result = await manager.get_or_create("ses_abc")
@@ -237,27 +238,47 @@ class TestChromePoolManagerSessions:
         manager = _make_manager()
 
         mock_browser_cdp = _make_mock_browser_cdp()
+        mock_proxy = make_mock_proxy()
+
         mock_browser_cdp.send = AsyncMock(
             side_effect=[
-                # Target.createBrowserContext succeeds
+                # Attempt 1: Target.createBrowserContext succeeds
                 {"browserContextId": "ctx_fail"},
-                # Target.createTarget fails
+                # Attempt 1: Target.createTarget fails
                 RuntimeError("Target creation failed"),
+                # Attempt 1: Target.disposeBrowserContext (cleanup) — succeeds
+                {},
+                # Attempt 2 (after retry): Target.createBrowserContext succeeds
+                {"browserContextId": "ctx_fail2"},
+                # Attempt 2: Target.createTarget fails again
+                RuntimeError("Target creation failed"),
+                # Attempt 2: Target.disposeBrowserContext (cleanup) — succeeds
+                {},
             ]
         )
+
+        async def restore_shared_chrome() -> None:
+            """Simulate _ensure_shared_chrome restoring state after invalidation."""
+            manager._browser_cdp = mock_browser_cdp
+            manager._shared_proxy = mock_proxy
+
         manager._browser_cdp = mock_browser_cdp
-        manager._shared_proxy = make_mock_proxy()
+        manager._shared_proxy = mock_proxy
         manager._shared_pid = 9999
 
         with (
-            patch.object(manager, "_ensure_shared_chrome", new_callable=AsyncMock),
+            patch.object(
+                manager,
+                "_ensure_shared_chrome",
+                new_callable=AsyncMock,
+                side_effect=restore_shared_chrome,
+            ),
+            patch.object(manager, "_kill_shared_chrome", new_callable=AsyncMock),
             pytest.raises(RuntimeError, match="Target creation failed"),
         ):
             await manager.get_or_create("ses_fail")
 
         assert "ses_fail" not in manager._instances
-        # Should have attempted to dispose the browser context
-        assert mock_browser_cdp.send.call_count == 3  # create ctx + create target + dispose ctx
 
 
 # --- Tab Operations Tests ---
@@ -439,3 +460,173 @@ class TestChromePoolManagerCleanup:
         ):
             manager = ChromePoolManager()
             assert manager is not None
+
+
+# --- Chrome Adoption & Default Tab Tests ---
+
+
+class TestTryAdoptExistingChrome:
+    """Tests for _try_adopt_existing_chrome (multi-process Chrome sharing)."""
+
+    @pytest.mark.asyncio
+    async def test_adopt_succeeds_when_chrome_running(self) -> None:
+        """Should adopt an existing Chrome on the debugging port."""
+        manager = _make_manager()
+
+        mock_proxy = make_mock_proxy()
+        mock_browser_cdp = _make_mock_browser_cdp()
+
+        with (
+            patch("wsl_chrome_mcp.chrome_pool.CDPProxyClient", return_value=mock_proxy),
+            patch.object(manager, "_connect_browser_cdp", new_callable=AsyncMock),
+        ):
+            result = await manager._try_adopt_existing_chrome()
+
+        assert result is True
+        assert manager._shared_proxy is mock_proxy
+        assert manager._shared_pid is None  # We don't own the process
+        assert manager._shared_user_data_dir is None
+
+    @pytest.mark.asyncio
+    async def test_adopt_fails_when_no_chrome(self) -> None:
+        """Should return False when no Chrome is running on the port."""
+        manager = _make_manager()
+
+        mock_proxy = MagicMock()
+        mock_proxy.get_version = AsyncMock(return_value=None)
+
+        with patch("wsl_chrome_mcp.chrome_pool.CDPProxyClient", return_value=mock_proxy):
+            result = await manager._try_adopt_existing_chrome()
+
+        assert result is False
+        assert manager._shared_proxy is None
+
+    @pytest.mark.asyncio
+    async def test_adopt_fails_on_connection_error(self) -> None:
+        """Should return False when probing Chrome throws an error."""
+        manager = _make_manager()
+
+        mock_proxy = MagicMock()
+        mock_proxy.get_version = AsyncMock(side_effect=ConnectionError("refused"))
+
+        with patch("wsl_chrome_mcp.chrome_pool.CDPProxyClient", return_value=mock_proxy):
+            result = await manager._try_adopt_existing_chrome()
+
+        assert result is False
+        assert manager._shared_proxy is None
+
+    @pytest.mark.asyncio
+    async def test_adopt_does_not_kill_on_cleanup(self) -> None:
+        """Adopted Chrome (pid=None) should not be killed during cleanup."""
+        manager = _make_manager()
+
+        mock_proxy = make_mock_proxy()
+        mock_browser_cdp = _make_mock_browser_cdp()
+
+        with (
+            patch("wsl_chrome_mcp.chrome_pool.CDPProxyClient", return_value=mock_proxy),
+            patch.object(manager, "_connect_browser_cdp", new_callable=AsyncMock),
+        ):
+            await manager._try_adopt_existing_chrome()
+
+        # Now kill — should NOT call run_windows_command (no PID to kill)
+        with patch("wsl_chrome_mcp.chrome_pool.run_windows_command") as mock_run:
+            await manager._kill_shared_chrome()
+            mock_run.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_ensure_shared_chrome_adopts_before_launching(self) -> None:
+        """_ensure_shared_chrome should try adoption before launching new Chrome."""
+        manager = _make_manager()
+
+        with (
+            patch.object(
+                manager,
+                "_try_adopt_existing_chrome",
+                new_callable=AsyncMock,
+                return_value=True,
+            ) as mock_adopt,
+            patch.object(
+                manager,
+                "_find_chrome_path",
+                new_callable=AsyncMock,
+            ) as mock_find,
+        ):
+            await manager._ensure_shared_chrome()
+
+        mock_adopt.assert_called_once()
+        mock_find.assert_not_called()  # Should skip launch since adoption succeeded
+
+
+class TestCloseDefaultTabs:
+    """Tests for _close_default_tabs."""
+
+    @pytest.mark.asyncio
+    async def test_closes_default_tab_when_we_launched_chrome(self) -> None:
+        """Should close all non-session pages when we own the Chrome process."""
+        manager = _make_manager()
+        manager._shared_pid = 9999
+        mock_browser_cdp = _make_mock_browser_cdp()
+        mock_browser_cdp.send = AsyncMock(
+            return_value={
+                "targetInfos": [
+                    {"targetId": "default-tab", "type": "page"},
+                    {"targetId": "session-tab", "type": "page"},
+                    {"targetId": "devtools", "type": "other"},
+                ]
+            }
+        )
+        manager._browser_cdp = mock_browser_cdp
+
+        await manager._close_default_tabs("session-tab")
+
+        assert mock_browser_cdp.send.call_count == 2
+        mock_browser_cdp.send.assert_any_call("Target.getTargets", {})
+        mock_browser_cdp.send.assert_any_call("Target.closeTarget", {"targetId": "default-tab"})
+        assert manager._default_tabs_closed is True
+
+    @pytest.mark.asyncio
+    async def test_skips_when_chrome_was_adopted(self) -> None:
+        """Should never close tabs when Chrome was adopted (pid=None)."""
+        manager = _make_manager()
+        manager._shared_pid = None
+        mock_browser_cdp = _make_mock_browser_cdp()
+        manager._browser_cdp = mock_browser_cdp
+
+        await manager._close_default_tabs("some-target")
+
+        mock_browser_cdp.send.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_runs_only_once(self) -> None:
+        """Should only run on first session creation, not subsequent ones."""
+        manager = _make_manager()
+        manager._shared_pid = 9999
+        manager._default_tabs_closed = True
+        mock_browser_cdp = _make_mock_browser_cdp()
+        manager._browser_cdp = mock_browser_cdp
+
+        await manager._close_default_tabs("some-target")
+
+        mock_browser_cdp.send.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_handles_missing_browser_cdp(self) -> None:
+        """Should not raise when browser_cdp is None."""
+        manager = _make_manager()
+        manager._shared_pid = 9999
+        manager._browser_cdp = None
+
+        await manager._close_default_tabs("some-target")
+
+    @pytest.mark.asyncio
+    async def test_handles_get_targets_error(self) -> None:
+        """Should not raise when Target.getTargets fails."""
+        manager = _make_manager()
+        manager._shared_pid = 9999
+        mock_browser_cdp = _make_mock_browser_cdp()
+        mock_browser_cdp.send = AsyncMock(side_effect=ConnectionError("failed"))
+        manager._browser_cdp = mock_browser_cdp
+
+        await manager._close_default_tabs("some-target")
+        assert manager._default_tabs_closed is True

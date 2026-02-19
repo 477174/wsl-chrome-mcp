@@ -161,6 +161,7 @@ class ChromePoolManager:
         self._shared_user_data_dir: str | None = None
         self._shared_proxy: CDPProxyClient | None = None
         self._browser_cdp: PersistentCDPClient | None = None
+        self._default_tabs_closed: bool = False
 
         self._cleanup_orphaned_temp_dirs()
 
@@ -425,6 +426,38 @@ class ChromePoolManager:
 
         return candidates
 
+    async def _try_adopt_existing_chrome(self) -> bool:
+        """Try to adopt an existing Chrome already running on the debugging port.
+
+        Another MCP process (from a different chat session) may have launched
+        Chrome on this port. Instead of launching a competing instance, we
+        connect to the existing one.
+
+        Returns:
+            True if we successfully adopted an existing Chrome.
+        """
+        try:
+            probe = CDPProxyClient(self._port)
+            version = await probe.get_version()
+            if not version:
+                return False
+
+            logger.info(
+                "Found existing Chrome on port %d: %s (adopting)",
+                self._port,
+                version.get("Browser", "unknown"),
+            )
+
+            self._shared_proxy = probe
+            self._shared_pid = None  # We don't own this process
+            self._shared_user_data_dir = None
+
+            await self._connect_browser_cdp()
+            return True
+        except Exception as e:
+            logger.debug("No adoptable Chrome on port %d: %s", self._port, e)
+            return False
+
     async def _ensure_shared_chrome(self) -> None:
         """Ensure the shared Chrome process and browser CDP are available."""
         if self._shared_proxy:
@@ -439,6 +472,11 @@ class ChromePoolManager:
 
             logger.warning("Shared Chrome appears to have died; invalidating sessions")
             await self._invalidate_all_sessions()
+
+        # Before launching a new Chrome, check if one is already running
+        # (e.g. launched by another MCP process / chat session)
+        if await self._try_adopt_existing_chrome():
+            return
 
         chrome_path = await self._find_chrome_path()
 
@@ -505,15 +543,6 @@ class ChromePoolManager:
         self._shared_user_data_dir = user_data_dir
         self._shared_proxy = shared_proxy
 
-        targets = await shared_proxy.list_targets()
-        default_pages = [target for target in targets if target.get("type") == "page"]
-        if default_pages:
-            default_target_id = default_pages[0].get("id")
-            if default_target_id:
-                with contextlib.suppress(Exception):
-                    await shared_proxy.close_page(default_target_id)
-                logger.debug("Closed shared Chrome default tab %s", default_target_id)
-
         try:
             await self._connect_browser_cdp()
         except Exception:
@@ -521,13 +550,13 @@ class ChromePoolManager:
             raise
 
     async def _connect_browser_cdp(self) -> None:
-        """Connect browser-level CDP for BrowserContext management."""
+        """Connect browser-level CDP for BrowserContext management.
+
+        Retries up to 3 times with 1s delay to handle the race condition
+        where Chrome's HTTP endpoint is ready but WebSocket returns 404.
+        """
         if not self._shared_proxy:
             raise RuntimeError("Shared Chrome proxy is not initialized")
-
-        browser_ws_url = await self._shared_proxy.get_browser_ws_url()
-        if not browser_ws_url:
-            raise RuntimeError("Failed to get browser WebSocket URL")
 
         if self._browser_cdp:
             with contextlib.suppress(Exception):
@@ -535,18 +564,50 @@ class ChromePoolManager:
             self._browser_cdp = None
 
         last_error: Exception | None = None
-        for ws_url in self._build_ws_candidates(browser_ws_url):
-            try:
-                client = PersistentCDPClient(ws_url, timeout=5.0)
-                await client.connect()
-                self._browser_cdp = client
-                logger.info("Connected browser CDP via %s", ws_url)
-                return
-            except Exception as e:
-                last_error = e
-                logger.debug("Browser CDP connection failed for %s: %s", ws_url, e)
+
+        for attempt in range(3):
+            if attempt > 0:
+                logger.debug("Browser CDP connection retry %d/3", attempt + 1)
+                await asyncio.sleep(1)
+
+            browser_ws_url = await self._shared_proxy.get_browser_ws_url()
+            if not browser_ws_url:
+                last_error = RuntimeError("Failed to get browser WebSocket URL")
+                continue
+
+            for ws_url in self._build_ws_candidates(browser_ws_url):
+                try:
+                    client = PersistentCDPClient(ws_url, timeout=5.0)
+                    await client.connect()
+                    self._browser_cdp = client
+                    logger.info("Connected browser CDP via %s", ws_url)
+                    return
+                except Exception as e:
+                    last_error = e
+                    logger.debug("Browser CDP connection failed for %s: %s", ws_url, e)
 
         raise ConnectionError(f"Failed to connect browser CDP: {last_error}")
+
+    async def _close_default_tabs(self, keep_target_id: str) -> None:
+        """Close Chrome's default about:blank tab after first session creation.
+
+        Runs ONCE, only when this process launched Chrome (_shared_pid set).
+        Skipped when Chrome was adopted from another process.
+        """
+        if self._default_tabs_closed or self._shared_pid is None or not self._browser_cdp:
+            return
+        self._default_tabs_closed = True
+
+        try:
+            result = await self._browser_cdp.send("Target.getTargets", {})
+            for target in result.get("targetInfos", []):
+                tid = target.get("targetId")
+                if target.get("type") == "page" and tid and tid != keep_target_id:
+                    with contextlib.suppress(Exception):
+                        await self._browser_cdp.send("Target.closeTarget", {"targetId": tid})
+                    logger.debug("Closed default tab %s", tid)
+        except Exception as e:
+            logger.debug("Failed to close default tabs: %s", e)
 
     async def _invalidate_all_sessions(self) -> None:
         """Invalidate all sessions after shared Chrome failure."""
@@ -593,6 +654,7 @@ class ChromePoolManager:
         self._shared_pid = None
         self._shared_user_data_dir = None
         self._direct_tcp_works = True
+        self._default_tabs_closed = False
 
     async def _disconnect_cdp(self, instance: ChromeInstance) -> None:
         """Disconnect page-level CDP for an instance."""
@@ -612,19 +674,53 @@ class ChromePoolManager:
         """
         if session_id in self._instances:
             instance = self._instances[session_id]
-            logger.debug("Returning existing Chrome for session %s", session_id)
 
             if not instance.is_connected and instance.current_target_id:
-                logger.info("Reconnecting CDP for session %s", session_id)
                 try:
-                    await self._connect_cdp(instance, instance.current_target_id)
-                except Exception as e:
-                    logger.warning("Failed to reconnect CDP: %s", e)
+                    await self._ensure_shared_chrome()
+                    targets = await self._shared_proxy.list_targets() if self._shared_proxy else []
+                    target_exists = any(t.get("id") == instance.current_target_id for t in targets)
+                except Exception:
+                    target_exists = False
 
-            return instance
+                if target_exists:
+                    logger.info("Reconnecting CDP for session %s", session_id)
+                    try:
+                        await self._connect_cdp(instance, instance.current_target_id)
+                    except Exception as e:
+                        logger.warning("Failed to reconnect CDP: %s", e)
+                    return instance
+
+                logger.info(
+                    "Session %s: target %s no longer exists (Chrome restarted), recreating",
+                    session_id,
+                    instance.current_target_id,
+                )
+                await self._disconnect_cdp(instance)
+                del self._instances[session_id]
+            else:
+                return instance
 
         logger.info("Creating new Chrome session %s", session_id)
 
+        for attempt in range(2):
+            try:
+                return await self._create_session(session_id)
+            except Exception as e:
+                if attempt == 0:
+                    logger.warning(
+                        "Session creation failed (%s), restarting Chrome and retrying",
+                        e,
+                    )
+                    await self._invalidate_all_sessions()
+                    await self._kill_shared_chrome()
+                    continue
+                raise
+
+        raise RuntimeError("Session creation failed after retry")
+
+    async def _create_session(self, session_id: str) -> ChromeInstance:
+        """Create a new isolated browser session backed by a BrowserContext."""
         await self._ensure_shared_chrome()
 
         if not self._browser_cdp or not self._shared_proxy:
@@ -651,6 +747,8 @@ class ChromePoolManager:
                 },
             )
             initial_target_id = target_result["targetId"]
+
+            await self._close_default_tabs(initial_target_id)
 
             instance = ChromeInstance(
                 session_id=session_id,
