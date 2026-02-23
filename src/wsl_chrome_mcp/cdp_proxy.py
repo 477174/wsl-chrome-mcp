@@ -54,7 +54,7 @@ class CDPProxyClient:
         try:
             result = run_windows_command(ps_cmd, timeout=15.0)
             if result.returncode == 0 and result.stdout.strip():
-                return json.loads(result.stdout.strip())
+                return json.loads(result.stdout.strip(), strict=False)
         except Exception as e:
             logger.error(f"HTTP request failed: {e}")
 

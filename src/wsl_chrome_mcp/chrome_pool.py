@@ -1,7 +1,11 @@
-"""Chrome pool manager using shared Chrome with per-session isolation.
+"""Chrome pool manager with per-session Chrome instances (isolated mode)
+or shared Chrome with per-session BrowserContexts (profile mode).
 
-All sessions share a single Chrome process and debugging port. Session
-isolation is provided by one CDP BrowserContext per session.
+Isolated mode: each session gets its own Chrome process on a unique port,
+providing complete isolation between sessions.
+
+Profile mode: all sessions share a single Chrome process and debugging port.
+Session isolation is provided by one CDP BrowserContext per session.
 """
 
 from __future__ import annotations
@@ -60,8 +64,10 @@ class DialogInfo:
 
 @dataclass
 class ChromeInstance:
-    """Session state backed by a shared Chrome process.
+    """Session state backed by a Chrome process.
 
+    In isolated mode, each instance owns its own Chrome process.
+    In profile mode, instances share a single Chrome process.
     Maintains persistent page-level CDP connection for real-time events.
     """
 
@@ -79,6 +85,7 @@ class ChromeInstance:
     # Tab tracking within this Chrome instance
     current_target_id: str | None = None
     targets: list[str] = field(default_factory=list)
+    window_id: int | None = None
 
     # Event-collected data
     console_messages: list[ConsoleMessage] = field(default_factory=list)
@@ -95,6 +102,10 @@ class ChromeInstance:
 
     # Emulation state (persisted across navigations)
     emulation_state: dict[str, Any] = field(default_factory=dict)
+
+    # Per-instance Chrome management (isolated mode)
+    instance_browser_cdp: PersistentCDPClient | None = None
+    owns_chrome: bool = False
 
     @property
     def is_connected(self) -> bool:
@@ -137,31 +148,39 @@ class ChromeInstance:
 
 
 class ChromePoolManager:
-    """Manages session-isolated BrowserContexts in a shared Chrome process."""
+    """Manages Chrome instances for MCP sessions.
+
+    Isolated mode: one Chrome process per session (complete isolation).
+    Profile mode: shared Chrome with per-session BrowserContexts.
+    """
 
     def __init__(
         self,
         port_min: int = 9222,
         port_max: int = 9322,
         headless: bool = False,
+        profile_mode: str = "isolated",
+        profile_name: str = "",
     ) -> None:
-        """Initialize the Chrome pool manager.
-
-        Args:
-            port_min: Debugging port for the shared Chrome process.
-            port_max: Ignored; kept for backward compatibility.
-            headless: Whether to launch Chrome in headless mode.
-        """
         self._instances: dict[str, ChromeInstance] = {}
         self._port = port_min
+        self._port_max = port_max
         self._headless = headless
+        self._profile_mode = profile_mode
+        self._profile_name = profile_name
         self._chrome_path: str | None = None
         self._direct_tcp_works: bool = True
+
+        # Per-session port tracking (isolated mode)
+        self._used_ports: set[int] = set()
+
+        # Shared Chrome state (profile mode only)
         self._shared_pid: int | None = None
         self._shared_user_data_dir: str | None = None
         self._shared_proxy: CDPProxyClient | None = None
         self._browser_cdp: PersistentCDPClient | None = None
         self._default_tabs_closed: bool = False
+        self._profile_context_id: str | None = None
 
         self._cleanup_orphaned_temp_dirs()
 
@@ -193,6 +212,42 @@ class ChromePoolManager:
                     )
         except Exception as e:
             logger.warning("Failed to clean up orphaned temp dirs: %s", e)
+
+    # --- Port allocation (isolated mode) ---
+
+    def _allocate_port(self) -> int:
+        """Find next available port in range.
+
+        Returns:
+            An available port number.
+
+        Raises:
+            RuntimeError: If no ports are available.
+        """
+        for port in range(self._port, self._port_max):
+            if port not in self._used_ports:
+                self._used_ports.add(port)
+                logger.debug("Allocated port %d", port)
+                return port
+        raise RuntimeError(
+            f"No available ports in range {self._port}-{self._port_max}. "
+            f"Too many concurrent sessions ({len(self._used_ports)})."
+        )
+
+    def _release_port(self, port: int) -> None:
+        """Return port to available pool."""
+        self._used_ports.discard(port)
+        logger.debug("Released port %d", port)
+
+    def _get_browser_cdp(self, instance: ChromeInstance) -> PersistentCDPClient | None:
+        """Get the browser-level CDP client for an instance.
+
+        Isolated mode instances have their own browser CDP.
+        Profile mode instances use the shared browser CDP.
+        """
+        if instance.owns_chrome:
+            return instance.instance_browser_cdp
+        return self._browser_cdp
 
     async def _find_chrome_path(self) -> str:
         """Find Chrome executable on Windows."""
@@ -351,28 +406,42 @@ class ChromePoolManager:
             await instance.cdp.disconnect()
 
         last_error: Exception | None = None
-
         if self._direct_tcp_works:
             candidate_urls = self._build_ws_candidates(original_ws_url)
-            for ws_url in candidate_urls:
-                try:
-                    logger.debug("Trying direct CDP connection: %s", ws_url)
-                    client = PersistentCDPClient(ws_url, timeout=5.0)
-                    await client.connect()
-                    instance.cdp = client
-                    await enable_domains(instance.cdp, ["Page", "Runtime", "Network", "DOM"])
-                    self._setup_event_handlers(instance)
-                    logger.info(
-                        "Session %s: CDP connected to target %s via %s",
+            for attempt in range(3):
+                if attempt > 0:
+                    logger.debug(
+                        "Session %s: page CDP retry %d/3",
                         instance.session_id,
-                        target_id,
-                        ws_url,
+                        attempt + 1,
                     )
-                    return
-                except Exception as e:
-                    logger.debug("Direct CDP failed for %s: %s", ws_url, e)
-                    last_error = e
+                    await asyncio.sleep(1)
+                    # Re-discover target in case URL changed
+                    targets = await instance.proxy.list_targets()
+                    target = next((t for t in targets if t.get("id") == target_id), None)
+                    if target:
+                        new_ws = target.get("webSocketDebuggerUrl", "")
+                        if new_ws:
+                            candidate_urls = self._build_ws_candidates(new_ws)
 
+                for ws_url in candidate_urls:
+                    try:
+                        logger.debug("Trying direct CDP connection: %s", ws_url)
+                        client = PersistentCDPClient(ws_url, timeout=5.0)
+                        await client.connect()
+                        instance.cdp = client
+                        await enable_domains(instance.cdp, ["Page", "Runtime", "Network", "DOM"])
+                        self._setup_event_handlers(instance)
+                        logger.info(
+                            "Session %s: CDP connected to target %s via %s",
+                            instance.session_id,
+                            target_id,
+                            ws_url,
+                        )
+                        return
+                    except Exception as e:
+                        logger.debug("Direct CDP failed for %s: %s", ws_url, e)
+                        last_error = e
             self._direct_tcp_works = False
             logger.info("Direct TCP connections failed; future attempts will use relay directly")
 
@@ -443,13 +512,14 @@ class ChromePoolManager:
                 return False
 
             logger.info(
-                "Found existing Chrome on port %d: %s (adopting)",
+                "Found existing Chrome on port %d: %s (adopting, profile_mode=%s)",
                 self._port,
                 version.get("Browser", "unknown"),
+                self._profile_mode,
             )
 
             self._shared_proxy = probe
-            self._shared_pid = None  # We don't own this process
+            self._shared_pid = None
             self._shared_user_data_dir = None
 
             await self._connect_browser_cdp()
@@ -480,20 +550,32 @@ class ChromePoolManager:
 
         chrome_path = await self._find_chrome_path()
 
-        create_temp_ps = (
-            '$temp = Join-Path $env:TEMP ("chrome-mcp-" + '
-            "[System.IO.Path]::GetRandomFileName()); "
-            "New-Item -ItemType Directory -Path $temp -Force | Out-Null; "
-            "Write-Output $temp"
-        )
-        result = run_windows_command(create_temp_ps, timeout=10.0)
-        user_data_dir = result.stdout.strip() if result.returncode == 0 else None
-        if not user_data_dir:
-            raise RuntimeError("Failed to create temp directory on Windows")
+        user_data_dir: str | None = None
+        owns_user_data = False
+
+        if self._profile_mode == "profile":
+            get_ud_ps = 'Write-Output "$env:LOCALAPPDATA\\Google\\Chrome\\User Data"'
+            result = run_windows_command(get_ud_ps, timeout=10.0)
+            user_data_dir = result.stdout.strip() if result.returncode == 0 else None
+            if not user_data_dir:
+                raise RuntimeError("Failed to resolve Chrome User Data directory")
+        else:
+            create_temp_ps = (
+                '$temp = Join-Path $env:TEMP ("chrome-mcp-" + '
+                "[System.IO.Path]::GetRandomFileName()); "
+                "New-Item -ItemType Directory -Path $temp -Force | Out-Null; "
+                "Write-Output $temp"
+            )
+            result = run_windows_command(create_temp_ps, timeout=10.0)
+            user_data_dir = result.stdout.strip() if result.returncode == 0 else None
+            if not user_data_dir:
+                raise RuntimeError("Failed to create temp directory on Windows")
+            owns_user_data = True
 
         logger.info(
-            "Launching shared Chrome on port %d (user_data_dir=%s)",
+            "Launching shared Chrome on port %d (profile_mode=%s, user_data_dir=%s)",
             self._port,
+            self._profile_mode,
             user_data_dir,
         )
 
@@ -504,16 +586,26 @@ class ChromePoolManager:
             f"--user-data-dir={user_data_dir}",
             "--no-first-run",
             "--no-default-browser-check",
+            "--disable-popup-blocking",
         ]
+        if self._profile_mode == "profile" and self._profile_name:
+            args.append(f"--profile-directory={self._profile_name}")
         if self._headless:
             args.append("--headless=new")
 
-        args_str = '","'.join(args)
+        arg_parts = []
+        for arg in args:
+            if " " in arg:
+                arg_parts.append(f'"{arg}"')
+            else:
+                arg_parts.append(arg)
+        args_line = " ".join(arg_parts)
         launch_ps = (
             f'$proc = Start-Process -FilePath "{chrome_path}" '
-            f'-ArgumentList "{args_str}" -PassThru; '
+            f"-ArgumentList '{args_line}' -PassThru; "
             "Write-Output $proc.Id"
         )
+        logger.debug("Chrome launch command: %s", launch_ps)
         result = run_windows_command(launch_ps, timeout=10.0)
 
         shared_pid: int | None = None
@@ -540,7 +632,7 @@ class ChromePoolManager:
             raise RuntimeError(f"Chrome did not start within 30 seconds on port {self._port}")
 
         self._shared_pid = shared_pid
-        self._shared_user_data_dir = user_data_dir
+        self._shared_user_data_dir = user_data_dir if owns_user_data else None
         self._shared_proxy = shared_proxy
 
         try:
@@ -587,6 +679,54 @@ class ChromePoolManager:
                     logger.debug("Browser CDP connection failed for %s: %s", ws_url, e)
 
         raise ConnectionError(f"Failed to connect browser CDP: {last_error}")
+
+    async def _connect_instance_browser_cdp(self, instance: ChromeInstance) -> None:
+        """Connect browser-level CDP for an isolated-mode instance.
+
+        Similar to _connect_browser_cdp but stores on the instance, not shared.
+        """
+        if not instance.proxy:
+            raise RuntimeError("Instance proxy is not initialized")
+
+        if instance.instance_browser_cdp:
+            with contextlib.suppress(Exception):
+                await instance.instance_browser_cdp.disconnect()
+            instance.instance_browser_cdp = None
+
+        last_error: Exception | None = None
+
+        for attempt in range(3):
+            if attempt > 0:
+                logger.debug(
+                    "Instance %s browser CDP retry %d/3",
+                    instance.session_id,
+                    attempt + 1,
+                )
+                await asyncio.sleep(1)
+
+            browser_ws_url = await instance.proxy.get_browser_ws_url()
+            if not browser_ws_url:
+                last_error = RuntimeError("Failed to get browser WebSocket URL")
+                continue
+
+            for ws_url in self._build_ws_candidates(browser_ws_url):
+                try:
+                    client = PersistentCDPClient(ws_url, timeout=5.0)
+                    await client.connect()
+                    instance.instance_browser_cdp = client
+                    logger.info(
+                        "Session %s: connected instance browser CDP via %s",
+                        instance.session_id,
+                        ws_url,
+                    )
+                    return
+                except Exception as e:
+                    last_error = e
+                    logger.debug("Instance browser CDP failed for %s: %s", ws_url, e)
+
+        raise ConnectionError(
+            f"Failed to connect instance browser CDP for {instance.session_id}: {last_error}"
+        )
 
     async def _close_default_tabs(self, keep_target_id: str) -> None:
         """Close Chrome's default about:blank tab after first session creation.
@@ -656,6 +796,45 @@ class ChromePoolManager:
         self._direct_tcp_works = True
         self._default_tabs_closed = False
 
+    async def _kill_instance_chrome(self, instance: ChromeInstance) -> None:
+        """Kill a per-session Chrome process and clean up its resources."""
+        if instance.instance_browser_cdp:
+            with contextlib.suppress(Exception):
+                await instance.instance_browser_cdp.disconnect()
+            instance.instance_browser_cdp = None
+
+        if instance.pid:
+            logger.info(
+                "Killing Chrome PID %d for session %s",
+                instance.pid,
+                instance.session_id,
+            )
+            kill_ps = f"Stop-Process -Id {instance.pid} -Force -ErrorAction SilentlyContinue"
+            try:
+                run_windows_command(kill_ps, timeout=10.0)
+            except Exception as e:
+                logger.warning(
+                    "Error killing Chrome PID %d for session %s: %s",
+                    instance.pid,
+                    instance.session_id,
+                    e,
+                )
+
+        if instance.user_data_dir:
+            cleanup_ps = (
+                f'Remove-Item -Path "{instance.user_data_dir}" '
+                "-Recurse -Force -ErrorAction SilentlyContinue"
+            )
+            try:
+                run_windows_command(cleanup_ps, timeout=10.0)
+            except Exception as e:
+                logger.warning(
+                    "Error cleaning up %s for session %s: %s",
+                    instance.user_data_dir,
+                    instance.session_id,
+                    e,
+                )
+
     async def _disconnect_cdp(self, instance: ChromeInstance) -> None:
         """Disconnect page-level CDP for an instance."""
         if instance.cdp:
@@ -675,78 +854,393 @@ class ChromePoolManager:
         if session_id in self._instances:
             instance = self._instances[session_id]
 
-            if not instance.is_connected and instance.current_target_id:
-                try:
-                    await self._ensure_shared_chrome()
-                    targets = await self._shared_proxy.list_targets() if self._shared_proxy else []
-                    target_exists = any(t.get("id") == instance.current_target_id for t in targets)
-                except Exception:
-                    target_exists = False
-
-                if target_exists:
-                    logger.info("Reconnecting CDP for session %s", session_id)
+            if instance.owns_chrome:
+                # Isolated mode: check this instance's own Chrome health
+                if not instance.is_connected and instance.current_target_id:
                     try:
-                        await self._connect_cdp(instance, instance.current_target_id)
-                    except Exception as e:
-                        logger.warning("Failed to reconnect CDP: %s", e)
+                        if instance.proxy:
+                            targets = await instance.proxy.list_targets()
+                            target_exists = any(
+                                t.get("id") == instance.current_target_id for t in targets
+                            )
+                        else:
+                            target_exists = False
+                    except Exception:
+                        target_exists = False
+
+                    if target_exists:
+                        logger.info("Reconnecting CDP for isolated session %s", session_id)
+                        try:
+                            await self._connect_cdp(instance, instance.current_target_id)
+                        except Exception as e:
+                            logger.warning("Failed to reconnect CDP: %s", e)
+                        return instance
+
+                    # Tracked tab gone — check if Chrome is still alive
+                    page_targets = [
+                        t for t in targets if t.get("type") == "page"
+                    ]
+                    if page_targets:
+                        # Chrome alive, just our tab was closed — adopt existing tab
+                        new_target = page_targets[0]
+                        new_target_id = new_target.get("id")
+                        logger.info(
+                            "Session %s: tracked tab %s closed, "
+                            "adopting existing tab %s (%s)",
+                            session_id,
+                            instance.current_target_id,
+                            new_target_id,
+                            new_target.get("url", "unknown"),
+                        )
+                        instance.current_target_id = new_target_id
+                        instance.targets = [
+                            str(t["id"]) for t in page_targets if t.get("id")
+                        ]
+                        try:
+                            await self._connect_cdp(instance, new_target_id)
+                        except Exception as e:
+                            logger.warning("Failed to connect to adopted tab: %s", e)
+                        return instance
+
+                    # No page targets — Chrome truly died, recreate
+                    logger.info(
+                        "Session %s: isolated Chrome dead (no page targets), recreating",
+                        session_id,
+                    )
+                    await self._disconnect_cdp(instance)
+                    await self._kill_instance_chrome(instance)
+                    self._release_port(instance.port)
+                    del self._instances[session_id]
+                else:
+                    return instance
+            else:
+                # Shared/profile mode: check shared Chrome health
+                if not instance.is_connected and instance.current_target_id:
+                    try:
+                        await self._ensure_shared_chrome()
+                        targets = (
+                            await self._shared_proxy.list_targets() if self._shared_proxy else []
+                        )
+                        target_exists = any(
+                            t.get("id") == instance.current_target_id for t in targets
+                        )
+                    except Exception:
+                        target_exists = False
+
+                    if target_exists:
+                        logger.info("Reconnecting CDP for session %s", session_id)
+                        try:
+                            await self._connect_cdp(instance, instance.current_target_id)
+                        except Exception as e:
+                            logger.warning("Failed to reconnect CDP: %s", e)
+                        return instance
+
+                    logger.info(
+                        "Session %s: target %s no longer exists (Chrome restarted), recreating",
+                        session_id,
+                        instance.current_target_id,
+                    )
+                    await self._disconnect_cdp(instance)
+                    del self._instances[session_id]
+                else:
                     return instance
 
-                logger.info(
-                    "Session %s: target %s no longer exists (Chrome restarted), recreating",
-                    session_id,
-                    instance.current_target_id,
-                )
-                await self._disconnect_cdp(instance)
-                del self._instances[session_id]
-            else:
-                return instance
+        logger.info(
+            "Creating new Chrome session %s (profile_mode=%s)", session_id, self._profile_mode
+        )
 
-        logger.info("Creating new Chrome session %s", session_id)
-
-        for attempt in range(2):
-            try:
-                return await self._create_session(session_id)
-            except Exception as e:
-                if attempt == 0:
+        if self._profile_mode != "profile":
+            # Isolated mode: per-session Chrome, retry with new port on failure
+            for attempt in range(3):
+                try:
+                    return await self._create_isolated_session(session_id)
+                except Exception as e:
                     logger.warning(
-                        "Session creation failed (%s), restarting Chrome and retrying",
+                        "Isolated session creation attempt %d failed: %s",
+                        attempt + 1,
                         e,
                     )
-                    await self._invalidate_all_sessions()
-                    await self._kill_shared_chrome()
-                    continue
-                raise
+                    if attempt == 2:
+                        raise
+            raise RuntimeError("Isolated session creation failed after retries")
+        else:
+            # Profile mode: shared Chrome, retry with Chrome restart
+            for attempt in range(2):
+                try:
+                    return await self._create_shared_session(session_id)
+                except Exception as e:
+                    if attempt == 0:
+                        logger.warning(
+                            "Session creation failed (%s), restarting Chrome and retrying",
+                            e,
+                        )
+                        await self._invalidate_all_sessions()
+                        await self._kill_shared_chrome()
+                        continue
+                    raise
+            raise RuntimeError("Session creation failed after retry")
 
-        raise RuntimeError("Session creation failed after retry")
+    async def _create_profile_tab(self) -> tuple[str, int]:
+        """Create a tab in the configured Chrome profile in a new window.
 
-    async def _create_session(self, session_id: str) -> ChromeInstance:
-        """Create a new isolated browser session backed by a BrowserContext."""
+        Chrome profile contexts are internal and can't be targeted via
+        ``Target.createTarget``. Instead we launch Chrome with
+        ``--profile-directory --new-window`` which opens an isolated window
+        in the correct profile through Chrome's singleton IPC.
+
+        Returns (targetId, windowId) of the new tab/window.
+        """
+        if not self._browser_cdp:
+            raise RuntimeError("Browser CDP not connected")
+
+        chrome_path = await self._find_chrome_path()
+
+        ud_result = run_windows_command(
+            'Write-Output "$env:LOCALAPPDATA\\Google\\Chrome\\MCP Data"',
+            timeout=10.0,
+        )
+        junction_path = ud_result.stdout.strip()
+        if not junction_path:
+            raise RuntimeError("Failed to resolve MCP Data junction path")
+
+        before_result = await self._browser_cdp.send("Target.getTargets", {})
+        before_ids = {t["targetId"] for t in before_result.get("targetInfos", [])}
+
+        profile_dir = self._profile_name
+        arg_line = (
+            f'--user-data-dir="{junction_path}" '
+            f'--profile-directory="{profile_dir}" '
+            f"--new-window about:blank"
+        )
+        launch_ps = f"Start-Process '{chrome_path}' -ArgumentList '{arg_line}'"
+        run_windows_command(launch_ps, timeout=10.0)
+
+        target_id: str | None = None
+        for _ in range(10):
+            await asyncio.sleep(0.5)
+            try:
+                result = await self._browser_cdp.send("Target.getTargets", {})
+                for t in result.get("targetInfos", []):
+                    if t["targetId"] not in before_ids and t.get("type") == "page":
+                        target_id = t["targetId"]
+                        self._profile_context_id = t.get("browserContextId", "")
+                        break
+                if target_id:
+                    break
+            except Exception:
+                continue
+
+        if not target_id:
+            raise RuntimeError(f"Failed to create tab in profile '{self._profile_name}'")
+
+        window_result = await self._browser_cdp.send(
+            "Browser.getWindowForTarget", {"targetId": target_id}
+        )
+        window_id = window_result["windowId"]
+
+        logger.info(
+            "Profile '%s' window created: target=%s window=%d ctx=%s",
+            self._profile_name,
+            target_id[:12],
+            window_id,
+            (self._profile_context_id or "")[:12],
+        )
+
+        return target_id, window_id
+
+    async def _create_isolated_session(self, session_id: str) -> ChromeInstance:
+        """Create a new session with its own dedicated Chrome process.
+
+        This is the original architecture: each session gets its own Chrome
+        on a unique port with a temp user-data-dir. Chrome's natural first
+        tab is used (no forced about:blank, no BrowserContext).
+        """
+        port = self._allocate_port()
+        chrome_path = await self._find_chrome_path()
+
+        # Create temp directory on Windows
+        create_temp_ps = (
+            '$temp = Join-Path $env:TEMP ("chrome-mcp-" + '
+            "[System.IO.Path]::GetRandomFileName()); "
+            "New-Item -ItemType Directory -Path $temp -Force | Out-Null; "
+            "Write-Output $temp"
+        )
+        result = run_windows_command(create_temp_ps, timeout=10.0)
+        user_data_dir = result.stdout.strip() if result.returncode == 0 else None
+
+        if not user_data_dir:
+            self._release_port(port)
+            raise RuntimeError("Failed to create temp directory on Windows")
+
+        logger.info(
+            "Launching Chrome for session %s on port %d (user_data_dir=%s)",
+            session_id,
+            port,
+            user_data_dir,
+        )
+
+        # Build Chrome arguments
+        args = [
+            f"--remote-debugging-port={port}",
+            "--remote-debugging-address=0.0.0.0",
+            "--remote-allow-origins=*",
+            f"--user-data-dir={user_data_dir}",
+            "--no-first-run",
+            "--no-default-browser-check",
+            "--disable-popup-blocking",
+        ]
+        if self._headless:
+            args.append("--headless=new")
+
+        arg_parts = []
+        for arg in args:
+            if " " in arg:
+                arg_parts.append(f'"{arg}"')
+            else:
+                arg_parts.append(arg)
+        args_line = " ".join(arg_parts)
+        launch_ps = (
+            f'$proc = Start-Process -FilePath "{chrome_path}" '
+            f"-ArgumentList '{args_line}' -PassThru; "
+            "Write-Output $proc.Id"
+        )
+        logger.debug("Chrome launch command: %s", launch_ps)
+        result = run_windows_command(launch_ps, timeout=10.0)
+
+        pid: int | None = None
+        if result.returncode == 0 and result.stdout.strip():
+            try:
+                pid = int(result.stdout.strip())
+                logger.info("Chrome launched with PID %d for session %s", pid, session_id)
+            except ValueError:
+                logger.warning("Could not parse Chrome PID: %s", result.stdout)
+
+        # Wait for Chrome to be ready
+        proxy = CDPProxyClient(port)
+        for _attempt in range(30):
+            await asyncio.sleep(1)
+            version = await proxy.get_version()
+            if version:
+                logger.info(
+                    "Chrome ready on port %d for session %s: %s",
+                    port,
+                    session_id,
+                    version.get("Browser", "unknown"),
+                )
+                break
+        else:
+            # Chrome didn't start — clean up
+            if pid:
+                kill_ps = f"Stop-Process -Id {pid} -Force -ErrorAction SilentlyContinue"
+                with contextlib.suppress(Exception):
+                    run_windows_command(kill_ps, timeout=10.0)
+            cleanup_ps = (
+                f'Remove-Item -Path "{user_data_dir}" -Recurse -Force -ErrorAction SilentlyContinue'
+            )
+            with contextlib.suppress(Exception):
+                run_windows_command(cleanup_ps, timeout=10.0)
+            self._release_port(port)
+            raise RuntimeError(f"Chrome did not start within 30 seconds on port {port}")
+
+        # Grab Chrome's natural first tab (whatever Chrome opened — NOT forced about:blank)
+        targets = await proxy.list_targets()
+        page_targets = [t for t in targets if t.get("type") == "page"]
+
+        if not page_targets:
+            # Shouldn't happen, but create a page if Chrome has none
+            new_page = await proxy.new_page()
+            if new_page:
+                initial_target_id = new_page.get("id")
+            else:
+                self._release_port(port)
+                raise RuntimeError("Chrome launched with no page targets")
+        else:
+            initial_target_id = page_targets[0].get("id")
+
+        if not initial_target_id:
+            self._release_port(port)
+            raise RuntimeError("Failed to get initial target ID")
+
+        instance = ChromeInstance(
+            session_id=session_id,
+            port=port,
+            pid=pid,
+            user_data_dir=user_data_dir,
+            proxy=proxy,
+            browser_context_id=None,  # No BrowserContext in isolated mode
+            current_target_id=initial_target_id,
+            targets=[initial_target_id],
+            owns_chrome=True,
+        )
+
+        # Connect browser-level CDP for this instance
+        try:
+            await self._connect_instance_browser_cdp(instance)
+        except Exception as e:
+            logger.warning(
+                "Session %s: failed to connect instance browser CDP: %s",
+                session_id,
+                e,
+            )
+
+        # Connect page-level CDP
+        try:
+            await self._connect_cdp(instance, initial_target_id)
+        except Exception as e:
+            logger.warning(
+                "Failed to establish persistent CDP connection, falling back to proxy: %s",
+                e,
+            )
+
+        if instance.is_connected:
+            logger.info(
+                "Session %s: persistent CDP connection established (isolated, port %d)",
+                session_id,
+                port,
+            )
+        elif instance.proxy:
+            logger.info(
+                "Session %s: using proxy-only mode (isolated, port %d)",
+                session_id,
+                port,
+            )
+
+        self._instances[session_id] = instance
+        return instance
+
+    async def _create_shared_session(self, session_id: str) -> ChromeInstance:
+        """Create a new session in the shared Chrome process (profile mode)."""
         await self._ensure_shared_chrome()
 
         if not self._browser_cdp or not self._shared_proxy:
             raise RuntimeError("Shared Chrome is not available")
 
         browser_context_id: str | None = None
-        try:
-            context_result = await self._browser_cdp.send(
-                "Target.createBrowserContext",
-                {"disposeOnDetach": True},
-            )
-            browser_context_id = context_result["browserContextId"]
-            logger.info(
-                "Session %s: created browser context %s",
-                session_id,
-                browser_context_id,
-            )
+        window_id: int | None = None
+        use_profile_cli = self._profile_mode == "profile" and bool(self._profile_name)
 
-            target_result = await self._browser_cdp.send(
-                "Target.createTarget",
-                {
-                    "url": "about:blank",
-                    "browserContextId": browser_context_id,
-                },
-            )
-            initial_target_id = target_result["targetId"]
+        try:
+            if use_profile_cli:
+                initial_target_id, window_id = await self._create_profile_tab()
+                browser_context_id = self._profile_context_id
+                logger.info(
+                    "Session %s: profile '%s' tab %s window=%d",
+                    session_id,
+                    self._profile_name,
+                    initial_target_id[:12],
+                    window_id,
+                )
+            else:
+                target_result = await self._browser_cdp.send(
+                    "Target.createTarget",
+                    {"url": "about:blank"},
+                )
+                initial_target_id = target_result["targetId"]
+                logger.info(
+                    "Session %s: default browser context (profile_mode=%s)",
+                    session_id,
+                    self._profile_mode,
+                )
 
             await self._close_default_tabs(initial_target_id)
 
@@ -759,6 +1253,8 @@ class ChromePoolManager:
                 browser_context_id=browser_context_id,
                 current_target_id=initial_target_id,
                 targets=[initial_target_id],
+                window_id=window_id,
+                owns_chrome=False,
             )
 
             try:
@@ -808,7 +1304,31 @@ class ChromePoolManager:
         instance = self._instances.pop(session_id)
         await self._disconnect_cdp(instance)
 
-        if instance.browser_context_id and self._browser_cdp and self._browser_cdp.is_connected:
+        if instance.owns_chrome:
+            # Isolated mode: kill this session's dedicated Chrome
+            await self._kill_instance_chrome(instance)
+            self._release_port(instance.port)
+            logger.info(
+                "Destroyed isolated Chrome session %s (port %d)",
+                session_id,
+                instance.port,
+            )
+        elif (
+            not instance.browser_context_id and self._browser_cdp and self._browser_cdp.is_connected
+        ):
+            # Profile mode: no BrowserContext to dispose, close tabs individually
+            for target_id in instance.targets:
+                with contextlib.suppress(Exception):
+                    await self._browser_cdp.send(
+                        "Target.closeTarget",
+                        {"targetId": target_id},
+                    )
+            logger.info(
+                "Session %s: closed %d tab(s) in profile mode",
+                session_id,
+                len(instance.targets),
+            )
+        elif instance.browser_context_id and self._browser_cdp and self._browser_cdp.is_connected:
             try:
                 await self._browser_cdp.send(
                     "Target.disposeBrowserContext",
@@ -826,8 +1346,8 @@ class ChromePoolManager:
                     instance.browser_context_id,
                     e,
                 )
-
-        logger.info("Destroyed Chrome session %s", session_id)
+        else:
+            logger.info("Destroyed Chrome session %s", session_id)
 
     async def cleanup_all(self) -> None:
         """Dispose all sessions and shut down shared Chrome."""
@@ -838,6 +1358,7 @@ class ChromePoolManager:
             except Exception as e:
                 logger.warning("Error destroying session %s: %s", session_id, e)
 
+        # Also kill shared Chrome if it was running (profile mode)
         await self._kill_shared_chrome()
 
     def list_sessions(self) -> dict[str, dict[str, Any]]:
@@ -859,51 +1380,194 @@ class ChromePoolManager:
                 "connected": instance.is_connected,
                 "console_count": len(instance.console_messages),
                 "network_count": len(instance.network_requests),
+                "owns_chrome": instance.owns_chrome,
             }
         return result
 
     # --- Tab operations (within a session's Chrome) ---
 
+    async def _poll_new_target(
+        self, before_ids: set[str], timeout: float = 3.0, interval: float = 0.3
+    ) -> str | None:
+        iterations = int(timeout / interval)
+        for _ in range(max(iterations, 1)):
+            await asyncio.sleep(interval)
+            if not self._browser_cdp:
+                return None
+            result = await self._browser_cdp.send("Target.getTargets", {})
+            for t in result.get("targetInfos", []):
+                if t["targetId"] not in before_ids and t.get("type") == "page":
+                    return t["targetId"]
+        return None
+
+    async def _verify_target_window(self, target_id: str, expected_window: int) -> bool:
+        if not self._browser_cdp:
+            return False
+        try:
+            result = await self._browser_cdp.send(
+                "Browser.getWindowForTarget", {"targetId": target_id}
+            )
+            return result.get("windowId") == expected_window
+        except Exception:
+            return False
+
     async def create_tab(self, session_id: str, url: str = "about:blank") -> str:
         """Create a new tab in a session's Chrome.
 
-        Args:
-            session_id: The session to create the tab in.
-            url: URL to open in the new tab.
-
-        Returns:
-            The target_id of the new tab.
-
-        Raises:
-            KeyError: If session not found.
+        Isolated mode: simple Target.createTarget (own Chrome, no confusion).
+        Profile mode: 3-tier fallback for window placement.
         """
         instance = self._instances[session_id]
 
-        if not instance.browser_context_id:
-            raise RuntimeError("No browser context available for session")
+        if instance.owns_chrome:
+            # Isolated mode: use instance's own browser CDP
+            browser_cdp = instance.instance_browser_cdp
+            if not browser_cdp or not browser_cdp.is_connected:
+                # Try to reconnect
+                await self._connect_instance_browser_cdp(instance)
+                browser_cdp = instance.instance_browser_cdp
+            if not browser_cdp:
+                raise RuntimeError("Instance browser CDP is not connected")
 
-        if not self._browser_cdp or not self._browser_cdp.is_connected:
-            await self._ensure_shared_chrome()
+            result = await browser_cdp.send(
+                "Target.createTarget",
+                {"url": url},
+            )
+            new_target_id = result["targetId"]
+        elif instance.window_id is not None:
+            # Profile mode with window scoping
+            if not self._browser_cdp or not self._browser_cdp.is_connected:
+                await self._ensure_shared_chrome()
+            if not self._browser_cdp:
+                raise RuntimeError("Browser CDP is not connected")
+            new_target_id = await self._create_profile_mode_tab(instance, url)
+        else:
+            # Shared mode without window scoping
+            if not self._browser_cdp or not self._browser_cdp.is_connected:
+                await self._ensure_shared_chrome()
+            if not self._browser_cdp:
+                raise RuntimeError("Browser CDP is not connected")
 
-        if not self._browser_cdp:
-            raise RuntimeError("Browser CDP is not connected")
+            create_params: dict[str, Any] = {"url": url}
+            if instance.browser_context_id:
+                create_params["browserContextId"] = instance.browser_context_id
 
-        result = await self._browser_cdp.send(
-            "Target.createTarget",
-            {
-                "url": url,
-                "browserContextId": instance.browser_context_id,
-            },
+            result = await self._browser_cdp.send(
+                "Target.createTarget",
+                create_params,
+            )
+            new_target_id = result["targetId"]
+
+        instance.targets.append(new_target_id)
+        await self.switch_tab(session_id, new_target_id)
+
+        logger.info(
+            "Session %s: created tab %s -> %s",
+            session_id,
+            new_target_id,
+            url,
         )
-        target_id = result["targetId"]
+        return new_target_id
 
-        instance.targets.append(target_id)
+    async def _create_profile_mode_tab(self, instance: ChromeInstance, url: str) -> str:
+        import json as _json
 
-        # Switch to new tab
-        await self.switch_tab(session_id, target_id)
+        before_result = await self._browser_cdp.send("Target.getTargets", {})  # type: ignore[union-attr]
+        before_ids = {t["targetId"] for t in before_result.get("targetInfos", [])}
 
-        logger.info("Session %s: created tab %s -> %s", session_id, target_id, url)
-        return target_id
+        # Tier 1: window.open() with userGesture bypasses popup blocker
+        # and guarantees same-window placement
+        if instance.cdp and instance.cdp.is_connected:
+            try:
+                safe_url_js = _json.dumps(url)
+                await instance.cdp.send(
+                    "Runtime.evaluate",
+                    {
+                        "expression": f"window.open({safe_url_js}, '_blank')",
+                        "userGesture": True,
+                    },
+                )
+                target_id = await self._poll_new_target(before_ids, timeout=5.0, interval=0.5)
+                if target_id:
+                    logger.info(
+                        "Session %s: tab created via window.open (tier 1)",
+                        instance.session_id,
+                    )
+                    return target_id
+                logger.warning(
+                    "Session %s: window.open with userGesture produced no target, falling back",
+                    instance.session_id,
+                )
+            except Exception as exc:
+                logger.warning(
+                    "Session %s: window.open failed (%s), falling back",
+                    instance.session_id,
+                    exc,
+                )
+
+        # Tier 2: Target.createTarget with profile browserContextId —
+        # may fail ("Failed to find browser context") since profile contexts
+        # aren't in CDP's DevToolsBrowserContext map
+        if self._profile_context_id:
+            try:
+                result = await self._browser_cdp.send(  # type: ignore[union-attr]
+                    "Target.createTarget",
+                    {"url": url, "browserContextId": self._profile_context_id},
+                )
+                target_id = result["targetId"]
+                logger.info(
+                    "Session %s: tab created via Target.createTarget (tier 2)",
+                    instance.session_id,
+                )
+                return target_id
+            except Exception as exc:
+                logger.warning(
+                    "Session %s: Target.createTarget with browserContextId "
+                    "failed (%s), falling back to CLI",
+                    instance.session_id,
+                    exc,
+                )
+
+        # Tier 3: Chrome CLI — reliable but may land in wrong window
+        try:
+            chrome_path = await self._find_chrome_path()
+            ud_result = run_windows_command(
+                'Write-Output "$env:LOCALAPPDATA\\Google\\Chrome\\MCP Data"',
+                timeout=10.0,
+            )
+            junction_path = ud_result.stdout.strip()
+            if not junction_path:
+                raise RuntimeError("Failed to resolve MCP Data junction path")
+
+            before_result = await self._browser_cdp.send(  # type: ignore[union-attr]
+                "Target.getTargets", {}
+            )
+            before_ids = {t["targetId"] for t in before_result.get("targetInfos", [])}
+
+            safe_url_cli = url.replace("'", "''")
+            arg_line = (
+                f'--user-data-dir="{junction_path}" '
+                f'--profile-directory="{self._profile_name}" '
+                f'"{safe_url_cli}"'
+            )
+            launch_ps = f"Start-Process '{chrome_path}' -ArgumentList '{arg_line}'"
+            run_windows_command(launch_ps, timeout=10.0)
+
+            target_id = await self._poll_new_target(before_ids, timeout=5.0, interval=0.5)
+            if target_id:
+                logger.info(
+                    "Session %s: tab created via Chrome CLI (tier 3)",
+                    instance.session_id,
+                )
+                return target_id
+        except Exception as exc:
+            logger.error(
+                "Session %s: Chrome CLI tab creation failed: %s",
+                instance.session_id,
+                exc,
+            )
+
+        raise RuntimeError(f"All tab creation methods failed for session {instance.session_id}")
 
     async def switch_tab(self, session_id: str, target_id: str) -> None:
         """Switch the active tab in a session's Chrome.
@@ -930,9 +1594,11 @@ class ChromePoolManager:
                 await instance.cdp.disconnect()
             instance.cdp = None
 
-        if self._browser_cdp and self._browser_cdp.is_connected:
+        # Activate target using the correct browser CDP
+        browser_cdp = self._get_browser_cdp(instance)
+        if browser_cdp and browser_cdp.is_connected:
             try:
-                await self._browser_cdp.send(
+                await browser_cdp.send(
                     "Target.activateTarget",
                     {"targetId": target_id},
                 )

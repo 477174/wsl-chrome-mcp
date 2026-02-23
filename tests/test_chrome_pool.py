@@ -144,33 +144,46 @@ class TestChromePoolManagerSessions:
 
     @pytest.mark.asyncio
     async def test_get_or_create_new_session(self) -> None:
-        """Should create browser context and target for new session."""
+        """Should create isolated session with dedicated Chrome for new session."""
         manager = _make_manager()
+        expected_instance = make_chrome_instance("ses_new", port=9222, browser_context_id=None)
+        expected_instance.owns_chrome = True
 
-        # Set up shared Chrome state
+        with patch.object(
+            manager,
+            "_create_isolated_session",
+            new_callable=AsyncMock,
+            return_value=expected_instance,
+        ) as mock_create:
+            result = await manager.get_or_create("ses_new")
+
+        mock_create.assert_called_once_with("ses_new")
+        assert result.session_id == "ses_new"
+        assert result.owns_chrome is True
+        assert result.browser_context_id is None
+    @pytest.mark.asyncio
+    async def test_get_or_create_profile_mode(self) -> None:
+        """Profile mode should create shared session with browser context."""
+        manager = _make_manager(profile_mode="profile", profile_name="Default")
         mock_browser_cdp = _make_mock_browser_cdp()
         mock_browser_cdp.send = AsyncMock(
             side_effect=[
-                # Target.createBrowserContext
-                {"browserContextId": "ctx_new"},
-                # Target.createTarget
                 {"targetId": "T_new"},
+                {"targetInfos": [{"targetId": "T_new", "type": "page"}]},
             ]
         )
         manager._browser_cdp = mock_browser_cdp
         manager._shared_proxy = make_mock_proxy()
         manager._shared_pid = 9999
-
         with (
             patch.object(manager, "_ensure_shared_chrome", new_callable=AsyncMock),
             patch.object(manager, "_connect_cdp", new_callable=AsyncMock),
+            patch.object(manager, "_create_profile_tab", new_callable=AsyncMock, return_value=("T_prof", 42)),
         ):
             result = await manager.get_or_create("ses_new")
-
         assert result.session_id == "ses_new"
-        assert result.browser_context_id == "ctx_new"
-        assert result.current_target_id == "T_new"
-        assert "T_new" in result.targets
+        assert result.owns_chrome is False
+        assert result.window_id == 42
         assert "ses_new" in manager._instances
 
     @pytest.mark.asyncio
@@ -233,39 +246,19 @@ class TestChromePoolManagerSessions:
         assert len(manager._instances) == 0
 
     @pytest.mark.asyncio
-    async def test_get_or_create_cleans_up_context_on_failure(self) -> None:
-        """Should dispose browser context if target creation fails."""
-        manager = _make_manager()
-
-        mock_browser_cdp = _make_mock_browser_cdp()
+    async def test_get_or_create_profile_mode_cleans_up_on_failure(self) -> None:
+        """Profile mode should clean up on failure and retry."""
+        manager = _make_manager(profile_mode="profile", profile_name="Default")
         mock_proxy = make_mock_proxy()
-
-        mock_browser_cdp.send = AsyncMock(
-            side_effect=[
-                # Attempt 1: Target.createBrowserContext succeeds
-                {"browserContextId": "ctx_fail"},
-                # Attempt 1: Target.createTarget fails
-                RuntimeError("Target creation failed"),
-                # Attempt 1: Target.disposeBrowserContext (cleanup) — succeeds
-                {},
-                # Attempt 2 (after retry): Target.createBrowserContext succeeds
-                {"browserContextId": "ctx_fail2"},
-                # Attempt 2: Target.createTarget fails again
-                RuntimeError("Target creation failed"),
-                # Attempt 2: Target.disposeBrowserContext (cleanup) — succeeds
-                {},
-            ]
-        )
+        mock_browser_cdp = _make_mock_browser_cdp()
 
         async def restore_shared_chrome() -> None:
-            """Simulate _ensure_shared_chrome restoring state after invalidation."""
             manager._browser_cdp = mock_browser_cdp
             manager._shared_proxy = mock_proxy
 
         manager._browser_cdp = mock_browser_cdp
         manager._shared_proxy = mock_proxy
         manager._shared_pid = 9999
-
         with (
             patch.object(
                 manager,
@@ -274,12 +267,16 @@ class TestChromePoolManagerSessions:
                 side_effect=restore_shared_chrome,
             ),
             patch.object(manager, "_kill_shared_chrome", new_callable=AsyncMock),
+            patch.object(
+                manager,
+                "_create_profile_tab",
+                new_callable=AsyncMock,
+                side_effect=RuntimeError("Target creation failed"),
+            ),
             pytest.raises(RuntimeError, match="Target creation failed"),
         ):
             await manager.get_or_create("ses_fail")
-
         assert "ses_fail" not in manager._instances
-
 
 # --- Tab Operations Tests ---
 
@@ -310,6 +307,84 @@ class TestChromePoolManagerTabs:
 
         assert target_id == "T2"
         assert "T2" in instance.targets
+
+    @pytest.mark.asyncio
+    async def test_create_tab_profile_mode_tier1_window_open(self) -> None:
+        """Profile-mode create_tab uses window.open with userGesture: true."""
+        manager = _make_manager()
+        instance = make_chrome_instance("ses_prof", browser_context_id="ctx_prof")
+        instance.window_id = 42
+
+        mock_page_cdp = MagicMock()
+        mock_page_cdp.is_connected = True
+        mock_page_cdp.send = AsyncMock(return_value={"result": {"type": "object"}})
+        instance.cdp = mock_page_cdp
+
+        manager._instances["ses_prof"] = instance
+
+        mock_browser_cdp = _make_mock_browser_cdp()
+        call_count = 0
+
+        async def _side_effect(method: str, params: dict | None = None) -> dict:
+            nonlocal call_count
+            if method == "Target.getTargets":
+                call_count += 1
+                if call_count <= 1:
+                    return {"targetInfos": [{"targetId": "T1", "type": "page"}]}
+                return {
+                    "targetInfos": [
+                        {"targetId": "T1", "type": "page"},
+                        {"targetId": "T_NEW", "type": "page"},
+                    ]
+                }
+            if method == "Target.activateTarget":
+                return {}
+            return {}
+
+        mock_browser_cdp.send = AsyncMock(side_effect=_side_effect)
+        manager._browser_cdp = mock_browser_cdp
+
+        with patch.object(manager, "_connect_cdp", new_callable=AsyncMock):
+            target_id = await manager.create_tab("ses_prof", "https://example.com")
+
+        assert target_id == "T_NEW"
+        assert "T_NEW" in instance.targets
+
+        page_send_calls = mock_page_cdp.send.call_args_list
+        rt_call = next(c for c in page_send_calls if c[0][0] == "Runtime.evaluate")
+        params = rt_call[0][1]
+        assert params["userGesture"] is True
+        assert "window.open(" in params["expression"]
+
+    @pytest.mark.asyncio
+    async def test_create_tab_profile_mode_tier2_fallback(self) -> None:
+        """Profile-mode falls back to Target.createTarget when window.open fails."""
+        manager = _make_manager()
+        instance = make_chrome_instance("ses_prof2", browser_context_id="ctx_prof2")
+        instance.window_id = 42
+        instance.cdp = None
+        manager._instances["ses_prof2"] = instance
+        manager._profile_context_id = "profile_ctx_123"
+
+        mock_browser_cdp = _make_mock_browser_cdp()
+
+        async def _side_effect(method: str, params: dict | None = None) -> dict:
+            if method == "Target.getTargets":
+                return {"targetInfos": [{"targetId": "T1", "type": "page"}]}
+            if method == "Target.createTarget":
+                return {"targetId": "T_TIER2"}
+            if method == "Target.activateTarget":
+                return {}
+            return {}
+
+        mock_browser_cdp.send = AsyncMock(side_effect=_side_effect)
+        manager._browser_cdp = mock_browser_cdp
+
+        with patch.object(manager, "_connect_cdp", new_callable=AsyncMock):
+            target_id = await manager.create_tab("ses_prof2", "https://example.com")
+
+        assert target_id == "T_TIER2"
+        assert "T_TIER2" in instance.targets
 
     @pytest.mark.asyncio
     async def test_switch_tab_updates_current(self) -> None:

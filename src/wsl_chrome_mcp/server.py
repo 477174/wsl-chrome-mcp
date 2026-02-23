@@ -24,6 +24,7 @@ from mcp.types import (
 )
 
 from .chrome_pool import ChromeInstance, ChromePoolManager
+from .config import load_config
 from .logging_config import setup_logging
 from .tools import get_all_tools, get_tool
 from .tools.base import ContentResult
@@ -95,7 +96,10 @@ class ToolContextImpl:
     async def send_cdp(self, method: str, params: dict[str, Any] | None = None) -> dict[str, Any]:
         """Send a CDP command using persistent connection or proxy fallback."""
         if self._instance.cdp and self._instance.is_connected:
-            return await self._instance.cdp.send(method, params)
+            try:
+                return await self._instance.cdp.send(method, params)
+            except Exception as e:
+                logger.warning("Persistent CDP send failed, falling back to proxy: %s", e)
 
         if not self._instance.proxy:
             raise RuntimeError("No CDP connection available (no proxy)")
@@ -179,7 +183,19 @@ class ChromeMCPServer:
                 logger.info("call_tool: %s session_id=%s", name, session_id)
 
                 if self._pool is None:
-                    self._pool = ChromePoolManager()
+                    cfg = load_config()
+                    if cfg.chrome.profile_mode == "profile":
+                        self._pool = ChromePoolManager(
+                            port_min=cfg.chrome.debug_port,
+                            headless=cfg.chrome.headless,
+                            profile_mode=cfg.chrome.profile_mode,
+                            profile_name=cfg.chrome.profile_name,
+                        )
+                    else:
+                        self._pool = ChromePoolManager(
+                            port_min=cfg.chrome.debug_port,
+                            headless=cfg.chrome.headless,
+                        )
 
                 # Resolve tool name aliases
                 resolved_name = TOOL_ALIASES.get(name, name)

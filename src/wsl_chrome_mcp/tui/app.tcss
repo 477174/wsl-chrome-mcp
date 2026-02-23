@@ -1,0 +1,98 @@
+Screen {
+    background: $surface;
+}
+
+#main-scroll {
+    scrollbar-size: 1 1;
+}
+
+.section-title {
+    background: $primary-background;
+    color: $text;
+    padding: 0 1;
+    text-style: bold;
+    width: 100%;
+    margin-top: 1;
+}
+
+.config-row {
+    layout: horizontal;
+    height: auto;
+    padding: 0 2;
+    min-height: 1;
+}
+
+.config-row:hover {
+    background: $surface-lighten-1;
+}
+
+.config-label {
+    width: 24;
+    padding: 0 1 0 0;
+    color: $text-muted;
+}
+
+.config-value {
+    width: 1fr;
+}
+
+.status-ok {
+    color: $success;
+}
+
+.status-warn {
+    color: $warning;
+}
+
+.status-error {
+    color: $error;
+}
+
+.status-off {
+    color: $text-muted;
+}
+
+Switch {
+    height: auto;
+    width: auto;
+    border: none;
+    padding: 0;
+}
+
+#port-input {
+    width: 10;
+    height: 1;
+    border: none;
+    padding: 0;
+}
+
+Select {
+    width: 44;
+    height: auto;
+    border: none;
+    padding: 0;
+}
+
+#profile-row {
+    height: auto;
+}
+
+.action-bar {
+    layout: horizontal;
+    height: auto;
+    padding: 0 2;
+    margin-top: 0;
+}
+
+.action-btn {
+    margin: 0 1 0 0;
+    min-width: 16;
+}
+
+#status-bar {
+    dock: bottom;
+    height: 1;
+    background: $primary;
+    color: $text;
+    padding: 0 1;
+}
