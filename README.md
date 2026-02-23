@@ -1,50 +1,37 @@
 # WSL Chrome MCP
 
-Chrome DevTools MCP server that works seamlessly in WSL (Windows Subsystem for Linux) by automatically detecting and connecting to Windows Chrome.
+Chrome DevTools Protocol (CDP) server for the [Model Context Protocol](https://modelcontextprotocol.io/), designed for WSL. Each MCP session gets its own isolated Chrome instance on Windows — no tab conflicts, no data leaks between sessions.
 
-## The Problem
+## Key Features
 
-When running Claude Code or other MCP clients in WSL, browser automation tools like [chrome-devtools-mcp](https://github.com/ChromeDevTools/chrome-devtools-mcp) don't work out of the box because:
-
-1. Chrome is installed on Windows, not in WSL
-2. The MCP server runs in WSL and can't directly launch Windows Chrome
-3. Network connectivity between WSL and Windows requires special handling
-
-## The Solution
-
-**wsl-chrome-mcp** automatically:
-
-- Detects when running in WSL
-- Finds Chrome on Windows
-- Launches Chrome with remote debugging enabled
-- Connects to Chrome via the Chrome DevTools Protocol (CDP)
-- Provides the same tools as chrome-devtools-mcp
-
-**Zero extra effort** - it just works like on native Ubuntu.
+- **Per-session Chrome isolation** — Each MCP client session launches its own Chrome process with a temporary profile. Sessions can't interfere with each other or your personal browser.
+- **Profile mode** — Optionally share a single Chrome instance across sessions using window-scoped tab isolation, preserving your logged-in state and bookmarks.
+- **33 browser automation tools** — Navigation, input, screenshots, accessibility snapshots, JavaScript execution, network monitoring, performance tracing, device emulation.
+- **Persistent CDP connection** — Direct WebSocket connection with automatic retry (3 attempts), PowerShell relay fallback, and HTTP proxy as last resort.
+- **TUI configuration dashboard** — Interactive terminal UI (`wsl-chrome-mcp config`) for managing all settings.
+- **WSL2 mirrored networking** — Native support for WSL2's mirrored networking mode (localhost access to Windows).
+- **Always-on CDP** — Optional mode to keep Chrome's debugging port enabled permanently by injecting `--remote-debugging-port` into Windows shortcuts and registry protocol handlers.
 
 ## Installation
 
-### 1. Install the MCP server
-
 ```bash
 # Clone the repository
-git clone https://github.com/yourusername/wsl-chrome-mcp.git
+git clone https://github.com/477174/wsl-chrome-mcp.git
 cd wsl-chrome-mcp
 
 # Install with uv (recommended)
 uv pip install -e .
-
-# Or with pip
-pip install -e .
 ```
 
-### 2. Add to Claude Code
+### Add to your MCP client
+
+**Claude Code:**
 
 ```bash
 claude mcp add wsl-chrome-mcp -- uv run wsl-chrome-mcp
 ```
 
-Or manually add to your MCP configuration (`~/.config/claude-code/mcp.json` or `claude_desktop_config.json`):
+**Manual configuration** (`~/.config/claude-code/mcp.json` or equivalent):
 
 ```json
 {
@@ -57,96 +44,191 @@ Or manually add to your MCP configuration (`~/.config/claude-code/mcp.json` or `
 }
 ```
 
-### Alternative: Connect to existing Chrome
+## Available Tools (33)
 
-If you prefer to manage Chrome yourself:
-
-1. Start Chrome on Windows with remote debugging:
-   ```powershell
-   # In PowerShell
-   & "C:\Program Files\Google\Chrome\Application\chrome.exe" --remote-debugging-port=9222
-   ```
-
-2. The MCP will automatically connect to it instead of launching a new instance.
-
-## Available Tools
+### Session Management (3)
 
 | Tool | Description |
 |------|-------------|
-| `chrome_navigate` | Navigate to a URL |
-| `chrome_screenshot` | Take a screenshot (viewport or full page) |
-| `chrome_click` | Click on an element by CSS selector |
-| `chrome_type` | Type text into an input field |
-| `chrome_get_html` | Get HTML content of page or element |
-| `chrome_evaluate` | Execute JavaScript and get result |
-| `chrome_console` | Get console messages (logs, errors, warnings) |
-| `chrome_network` | Get network requests made by the page |
-| `chrome_wait` | Wait for an element to appear |
-| `chrome_scroll` | Scroll the page or element |
-| `chrome_tabs` | List all open browser tabs |
-| `chrome_new_tab` | Open a new tab |
-| `chrome_close_tab` | Close a tab |
-| `chrome_switch_tab` | Switch to a different tab |
-| `chrome_pdf` | Generate a PDF of the current page |
+| `chrome_session_start` | Start a Chrome session with optional URL |
+| `chrome_session_list` | List all active sessions |
+| `chrome_session_end` | End a session and clean up its Chrome instance |
+
+### Navigation (7)
+
+| Tool | Description |
+|------|-------------|
+| `navigate_page` | Navigate to a URL and wait for load |
+| `list_pages` | List all open pages/tabs |
+| `select_page` | Switch to a different page/tab |
+| `new_page` | Open a new page/tab |
+| `close_page` | Close a page/tab |
+| `resize_page` | Resize the browser viewport |
+| `handle_dialog` | Accept or dismiss JavaScript dialogs (alert, confirm, prompt) |
+
+### Input (8)
+
+| Tool | Description |
+|------|-------------|
+| `click` | Click an element by accessibility UID |
+| `click_at` | Click at specific x,y coordinates |
+| `fill` | Type text into an input field by UID |
+| `fill_form` | Fill multiple form fields at once |
+| `hover` | Hover over an element by UID |
+| `drag` | Drag from one element to another |
+| `press_key` | Press keyboard keys (Enter, Tab, shortcuts) |
+| `upload_file` | Upload a file to a file input element |
+
+### Snapshot & Wait (2)
+
+| Tool | Description |
+|------|-------------|
+| `take_snapshot` | Capture accessibility tree as structured text with UIDs for element targeting |
+| `wait_for` | Wait for an element matching text/role to appear |
+
+### Screenshot & PDF (2)
+
+| Tool | Description |
+|------|-------------|
+| `take_screenshot` | Take a screenshot (viewport, full page, or specific element) |
+| `generate_pdf` | Generate a PDF of the current page |
+
+### Script (3)
+
+| Tool | Description |
+|------|-------------|
+| `evaluate` | Execute JavaScript expressions or functions in page context |
+| `get_html` | Get HTML content of the page or a specific element |
+| `scroll` | Scroll the page or a specific element |
+
+### Monitoring (4)
+
+| Tool | Description |
+|------|-------------|
+| `get_console` | Get console messages (log, warn, error) with filtering |
+| `get_console_message` | Get a specific console message by index |
+| `get_network` | Get network requests with filtering by URL, method, status |
+| `get_network_request` | Get detailed info for a specific network request |
+
+### Emulation (1)
+
+| Tool | Description |
+|------|-------------|
+| `emulate` | Emulate devices, viewports, dark mode, geolocation, network throttling (Slow 3G, Fast 3G, offline), CPU throttling, and custom user agents |
+
+### Performance (3)
+
+| Tool | Description |
+|------|-------------|
+| `performance_start_trace` | Start a Chrome performance trace |
+| `performance_stop_trace` | Stop trace and return recorded data |
+| `performance_analyze_insight` | Analyze trace data for performance insights |
+
+## Architecture
+
+```
+┌──────────────────────────────────────────────────────────────────────┐
+│                            WSL Linux                                 │
+│                                                                      │
+│  ┌────────────────────────────────────────────────────────────────┐  │
+│  │                      wsl-chrome-mcp                            │  │
+│  │                                                                │  │
+│  │  ┌──────────────┐    ┌──────────────────┐    ┌─────────────┐  │  │
+│  │  │  MCP Server   │───>│  Pool Manager    │───>│ Persistent  │  │  │
+│  │  │  (FastMCP)    │    │  (chrome_pool)   │    │ CDP Client  │  │  │
+│  │  └──────────────┘    └──────────────────┘    └──────┬──────┘  │  │
+│  │                                                      │         │  │
+│  │  ┌──────────────┐    ┌──────────────────┐           │         │  │
+│  │  │  33 Tools     │    │  Config Manager  │           │         │  │
+│  │  │  (modular)    │    │  (TOML)          │           │         │  │
+│  │  └──────────────┘    └──────────────────┘           │         │  │
+│  └──────────────────────────────────────────────────────┼─────────┘  │
+│                                                         │            │
+│                          CDP over WebSocket              │            │
+│                          (port 9222)                     │            │
+└─────────────────────────────────────────────────────────┼────────────┘
+                                                          │
+┌─────────────────────────────────────────────────────────┼────────────┐
+│                         Windows Host                     │            │
+│                                                          │            │
+│  Isolated Mode (default):          Profile Mode:         │            │
+│  ┌──────────┐ ┌──────────┐        ┌──────────────────┐  │            │
+│  │ Chrome 1  │ │ Chrome 2  │        │ Shared Chrome    │<─┘            │
+│  │ (temp     │ │ (temp     │        │ (your profile)   │               │
+│  │  profile) │ │  profile) │        │ window-scoped    │               │
+│  └──────────┘ └──────────┘        └──────────────────┘               │
+└──────────────────────────────────────────────────────────────────────┘
+```
+
+## Session Modes
+
+### Isolated Mode (default)
+
+Each MCP session launches a **separate Chrome process** with a temporary user data directory. Sessions are completely independent — different cookies, storage, and history. When the session ends, the temporary profile is deleted.
+
+- No interference with your personal Chrome
+- No interference between concurrent MCP sessions
+- Clean state every time
+
+```toml
+[chrome]
+profile_mode = "isolated"
+```
+
+### Profile Mode
+
+All sessions share a **single Chrome instance** using your existing Chrome profile. Each session gets its own window and tracks only the tabs it created. Your logged-in sessions, bookmarks, and extensions are available.
+
+- Preserves login state across sessions
+- Access to your bookmarks and extensions
+- Sessions isolated by window (not by process)
+
+```toml
+[chrome]
+profile_mode = "profile"
+profile_name = "Profile 1"
+```
+
+## Connection Strategy
+
+The server uses a multi-layer connection strategy with automatic fallback:
+
+1. **Direct WebSocket** — Connects directly to Chrome's CDP WebSocket endpoint (3 retries with 1s delay between attempts)
+2. **PowerShell Relay** — If direct connection fails, uses PowerShell on Windows as a WebSocket relay
+3. **HTTP Proxy** — Last resort, proxies CDP commands over HTTP
+
+Connection status is reported in tool responses (`Connected: True/False`). Even with `Connected: False` (proxy mode), all tools remain functional.
 
 ## Configuration
 
-Environment variables:
+Settings are stored in `~/.config/wsl-chrome-mcp/config.toml`:
 
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `CHROME_DEBUG_PORT` | `9222` | Remote debugging port |
-| `CHROME_HEADLESS` | `false` | Run Chrome in headless mode |
-| `CHROME_USER_DATA_DIR` | (temp) | Custom user data directory |
+```toml
+[chrome]
+debug_port = 9222         # CDP debugging port
+headless = false          # Run Chrome headless
+profile_mode = "isolated" # "isolated" or "profile"
+profile_name = ""         # Chrome profile name (profile mode only)
 
-Example with custom config:
+[network]
+mirrored_networking = true  # WSL2 mirrored networking mode
 
-```json
-{
-  "mcpServers": {
-    "wsl-chrome-mcp": {
-      "command": "uv",
-      "args": ["run", "--directory", "/path/to/wsl-chrome-mcp", "wsl-chrome-mcp"],
-      "env": {
-        "CHROME_DEBUG_PORT": "9223",
-        "CHROME_HEADLESS": "true"
-      }
-    }
-  }
-}
+[cdp]
+always_on = false         # Keep CDP enabled permanently via registry
+
+[plugin]
+installed = true          # Whether OpenCode plugin is installed
 ```
 
-## How It Works
+### Interactive Configuration
 
-```
-┌─────────────────────────────────────────────────────────────────┐
-│                           WSL Linux                             │
-│  ┌─────────────────────────────────────────────────────────────┐│
-│  │                    wsl-chrome-mcp                           ││
-│  │  ┌─────────────────────┐    ┌─────────────────────────────┐ ││
-│  │  │   MCP Server        │────│  CDP Client                 │ ││
-│  │  │   (Python)          │    │  (connects to Windows)      │ ││
-│  │  └─────────────────────┘    └─────────────────────────────┘ ││
-│  └─────────────────────────────────────────────────────────────┘│
-│                               │                                 │
-│                               │ CDP over TCP                    │
-│                               │ (port 9222)                     │
-└───────────────────────────────┼─────────────────────────────────┘
-                                │
-┌───────────────────────────────┼─────────────────────────────────┐
-│                        Windows Host                              │
-│                               │                                  │
-│  ┌────────────────────────────▼────────────────────────────────┐│
-│  │           Chrome Browser (with remote debugging)            ││
-│  │           --remote-debugging-port=9222                      ││
-│  └─────────────────────────────────────────────────────────────┘│
-└──────────────────────────────────────────────────────────────────┘
+Run the TUI dashboard to configure all settings interactively:
+
+```bash
+wsl-chrome-mcp config
 ```
 
-1. **WSL Detection**: Checks `/proc/version`, `/proc/sys/fs/binfmt_misc/WSLInterop`, and environment variables
-2. **Windows Host IP**: Resolves from `/etc/resolv.conf` nameserver (WSL2) or environment variables
-3. **Chrome Launch**: Uses `powershell.exe` from WSL to start Chrome on Windows
-4. **CDP Connection**: Connects to Chrome's debugging port over the WSL-Windows network bridge
+The TUI provides toggle switches, dropdown selectors, and profile detection with a real-time preview of your configuration.
 
 ## Development
 
@@ -154,8 +236,11 @@ Example with custom config:
 # Install dev dependencies
 uv pip install -e ".[dev]"
 
-# Run tests
+# Run tests (98 unit tests)
 uv run pytest
+
+# Run E2E concurrency test (requires Windows Chrome)
+uv run pytest tests/test_isolated_concurrency.py -v
 
 # Lint and format
 uv run ruff check .
@@ -178,19 +263,27 @@ Make sure Chrome is installed on Windows in one of these locations:
 
 1. Check if Chrome is running with remote debugging:
    ```bash
+   curl http://localhost:9222/json/version
+   ```
+
+2. Windows Firewall may be blocking port 9222. Add an inbound rule.
+
+3. If using WSL2 without mirrored networking, try the Windows host IP:
+   ```bash
    curl http://$(cat /etc/resolv.conf | grep nameserver | awk '{print $2}'):9222/json/version
    ```
 
-2. Windows Firewall might be blocking the connection. Add an inbound rule for port 9222.
+### Connected: False (proxy fallback)
 
-3. Try starting Chrome manually first:
-   ```powershell
-   & "C:\Program Files\Google\Chrome\Application\chrome.exe" --remote-debugging-port=9222
-   ```
+This means the direct WebSocket connection failed but the HTTP proxy is working. All tools still function normally. To restore direct connections:
+
+1. Ensure Chrome is running with `--remote-debugging-port=9222`
+2. Check that no other process is using port 9222
+3. Restart the MCP server to retry the connection
 
 ### WSL1 vs WSL2
 
-This MCP is optimized for WSL2. For WSL1, you may need to use `localhost` instead of the Windows host IP. Set the environment variable:
+This MCP is optimized for WSL2. For WSL1, you may need to use `localhost` instead of the Windows host IP:
 
 ```bash
 export WSL_HOST_IP=127.0.0.1
@@ -209,3 +302,4 @@ Inspired by [chrome-devtools-mcp](https://github.com/ChromeDevTools/chrome-devto
 - [Chrome DevTools MCP](https://github.com/ChromeDevTools/chrome-devtools-mcp)
 - [Chrome DevTools Protocol Documentation](https://chromedevtools.github.io/devtools-protocol/)
 - [MCP Python SDK](https://github.com/modelcontextprotocol/python-sdk)
+- [Model Context Protocol](https://modelcontextprotocol.io/)
