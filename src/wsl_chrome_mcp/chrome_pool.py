@@ -213,6 +213,47 @@ class ChromePoolManager:
         except Exception as e:
             logger.warning("Failed to clean up orphaned temp dirs: %s", e)
 
+    def _collect_all_pids(self) -> set[int]:
+        """Collect all Chrome PIDs from instances and shared Chrome.
+
+        Returns:
+            Set of all active Chrome process IDs.
+        """
+        pids: set[int] = set()
+
+        # Collect PIDs from all instances
+        for instance in self._instances.values():
+            if instance.pid is not None:
+                pids.add(instance.pid)
+
+        # Add shared Chrome PID if present
+        if self._shared_pid is not None:
+            pids.add(self._shared_pid)
+
+        return pids
+
+    def _sync_kill_all_chrome(self) -> None:
+        """Synchronously kill all Chrome processes.
+
+        This is a backup cleanup method for signal handlers and atexit.
+        Does NOT perform async CDP operations.
+        """
+        pids = self._collect_all_pids()
+
+        if not pids:
+            logger.debug("No Chrome processes to kill")
+            return
+
+        logger.info("Killing %d Chrome process(es): %s", len(pids), sorted(pids))
+
+        for pid in pids:
+            try:
+                kill_cmd = f"Stop-Process -Id {pid} -Force -ErrorAction SilentlyContinue"
+                run_windows_command(kill_cmd, timeout=5.0)
+                logger.debug("Killed Chrome PID %d", pid)
+            except Exception as e:
+                logger.warning("Failed to kill Chrome PID %d: %s", pid, e)
+
     # --- Port allocation (isolated mode) ---
 
     def _allocate_port(self) -> int:
@@ -877,25 +918,20 @@ class ChromePoolManager:
                         return instance
 
                     # Tracked tab gone — check if Chrome is still alive
-                    page_targets = [
-                        t for t in targets if t.get("type") == "page"
-                    ]
+                    page_targets = [t for t in targets if t.get("type") == "page"]
                     if page_targets:
                         # Chrome alive, just our tab was closed — adopt existing tab
                         new_target = page_targets[0]
                         new_target_id = new_target.get("id")
                         logger.info(
-                            "Session %s: tracked tab %s closed, "
-                            "adopting existing tab %s (%s)",
+                            "Session %s: tracked tab %s closed, adopting existing tab %s (%s)",
                             session_id,
                             instance.current_target_id,
                             new_target_id,
                             new_target.get("url", "unknown"),
                         )
                         instance.current_target_id = new_target_id
-                        instance.targets = [
-                            str(t["id"]) for t in page_targets if t.get("id")
-                        ]
+                        instance.targets = [str(t["id"]) for t in page_targets if t.get("id")]
                         try:
                             await self._connect_cdp(instance, new_target_id)
                         except Exception as e:

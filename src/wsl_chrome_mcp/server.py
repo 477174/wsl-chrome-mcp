@@ -10,7 +10,10 @@ with backwards-compatible aliases for old names (chrome_navigate, chrome_click, 
 from __future__ import annotations
 
 import asyncio
+import atexit
 import logging
+import signal
+import sys
 from collections.abc import Sequence
 from typing import Any
 
@@ -236,6 +239,19 @@ class ChromeMCPServer:
         except KeyError:
             return [TextContent(type="text", text=f"Session not found: {session_id}")]
 
+    def _signal_handler(self, signum: int, frame: Any) -> None:
+        """Handle SIGTERM and SIGINT signals."""
+        logger.info("Received signal %d, cleaning up Chrome processes", signum)
+        if self._pool is not None:
+            self._pool._sync_kill_all_chrome()
+        sys.exit(0)
+
+    def _atexit_handler(self) -> None:
+        """Handle process exit via atexit."""
+        logger.info("Process exiting, cleaning up Chrome processes")
+        if self._pool is not None:
+            self._pool._sync_kill_all_chrome()
+
     # --- Lifecycle ---
 
     async def run(self) -> None:
@@ -247,6 +263,10 @@ class ChromeMCPServer:
             logger.info(f"Running in WSL, Windows host IP: {host_ip}")
         else:
             logger.info("Running in native environment")
+
+        signal.signal(signal.SIGTERM, self._signal_handler)
+        signal.signal(signal.SIGINT, self._signal_handler)
+        atexit.register(self._atexit_handler)
 
         async with stdio_server() as (read_stream, write_stream):
             try:
