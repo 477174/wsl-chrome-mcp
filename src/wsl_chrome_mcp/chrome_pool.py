@@ -21,6 +21,7 @@ from typing import Any
 from .cdp_proxy import CDPProxyClient
 from .persistent_cdp import PersistentCDPClient, enable_domains
 from .ps_relay import PowerShellCDPRelay
+from .session_store import SessionRecord, SessionStore
 from .wsl import get_windows_host_ip, is_mirrored_networking, is_wsl, run_windows_command
 
 logger = logging.getLogger(__name__)
@@ -183,6 +184,8 @@ class ChromePoolManager:
         self._profile_context_id: str | None = None
 
         self._cleanup_orphaned_temp_dirs()
+        self._session_store = SessionStore()
+        self._session_store.cleanup_stale()
 
     def _cleanup_orphaned_temp_dirs(self) -> None:
         """Remove orphaned chrome-mcp-* temp directories from previous crashes.
@@ -253,6 +256,55 @@ class ChromePoolManager:
                 logger.debug("Killed Chrome PID %d", pid)
             except Exception as e:
                 logger.warning("Failed to kill Chrome PID %d: %s", pid, e)
+
+    async def _try_reconnect_from_record(self, record: SessionRecord) -> ChromeInstance | None:
+        """Try to reconnect to an orphaned Chrome using persisted session data."""
+        try:
+            proxy = CDPProxyClient(record.port)
+            version = await proxy.get_version()
+            if not version:
+                return None
+            logger.info(
+                "Found orphaned Chrome on port %d for session %s", record.port, record.session_id
+            )
+            targets = await proxy.list_targets()
+            page_targets = [t for t in targets if t.get("type") == "page"]
+            if not page_targets:
+                return None
+            current_target_id = record.current_target_id
+            target_exists = any(t.get("id") == current_target_id for t in page_targets)
+            if not target_exists:
+                current_target_id = page_targets[0].get("id")
+            all_target_ids = [str(t["id"]) for t in page_targets if t.get("id")]
+            instance = ChromeInstance(
+                session_id=record.session_id,
+                port=record.port,
+                pid=record.pid,
+                user_data_dir="",
+                proxy=proxy,
+                browser_context_id=record.browser_context_id,
+                current_target_id=current_target_id,
+                targets=all_target_ids,
+                owns_chrome=(record.profile_mode != "profile"),
+            )
+            if record.profile_mode != "profile":
+                self._used_ports.add(record.port)
+            try:
+                if instance.owns_chrome:
+                    await self._connect_instance_browser_cdp(instance)
+                if current_target_id:
+                    await self._connect_cdp(instance, current_target_id)
+            except Exception as e:
+                logger.warning("Reconnection CDP setup failed (proxy fallback): %s", e)
+            logger.info(
+                "Reconnected to orphaned Chrome session %s on port %d",
+                record.session_id,
+                record.port,
+            )
+            return instance
+        except Exception as e:
+            logger.debug("Failed to reconnect session %s: %s", record.session_id, e)
+            return None
 
     # --- Port allocation (isolated mode) ---
 
@@ -981,6 +1033,14 @@ class ChromePoolManager:
                 else:
                     return instance
 
+        record = self._session_store.load(session_id)
+        if record is not None:
+            instance = await self._try_reconnect_from_record(record)
+            if instance is not None:
+                self._instances[session_id] = instance
+                return instance
+            self._session_store.delete(session_id)
+
         logger.info(
             "Creating new Chrome session %s (profile_mode=%s)", session_id, self._profile_mode
         )
@@ -1242,6 +1302,17 @@ class ChromePoolManager:
             )
 
         self._instances[session_id] = instance
+        self._session_store.save(
+            SessionRecord(
+                session_id=instance.session_id,
+                port=instance.port,
+                pid=instance.pid,
+                target_ids=list(instance.targets),
+                current_target_id=instance.current_target_id,
+                profile_mode="isolated",
+                browser_context_id=instance.browser_context_id,
+            )
+        )
         return instance
 
     async def _create_shared_session(self, session_id: str) -> ChromeInstance:
@@ -1318,6 +1389,17 @@ class ChromePoolManager:
                 )
 
             self._instances[session_id] = instance
+            self._session_store.save(
+                SessionRecord(
+                    session_id=instance.session_id,
+                    port=instance.port,
+                    pid=instance.pid,
+                    target_ids=list(instance.targets),
+                    current_target_id=instance.current_target_id,
+                    profile_mode="profile",
+                    browser_context_id=instance.browser_context_id,
+                )
+            )
             return instance
         except Exception:
             if browser_context_id and self._browser_cdp and self._browser_cdp.is_connected:
@@ -1384,6 +1466,7 @@ class ChromePoolManager:
                 )
         else:
             logger.info("Destroyed Chrome session %s", session_id)
+        self._session_store.delete(session_id)
 
     async def cleanup_all(self) -> None:
         """Dispose all sessions and shut down shared Chrome."""
@@ -1396,6 +1479,8 @@ class ChromePoolManager:
 
         # Also kill shared Chrome if it was running (profile mode)
         await self._kill_shared_chrome()
+        for record in self._session_store.list_all():
+            self._session_store.delete(record.session_id)
 
     def list_sessions(self) -> dict[str, dict[str, Any]]:
         """List all active sessions.
