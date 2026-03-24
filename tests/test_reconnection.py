@@ -222,8 +222,8 @@ async def test_session_creation_persists_to_disk(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
-async def test_session_destroy_deletes_from_disk(tmp_path: Path) -> None:
-    """Should delete session file when destroyed."""
+async def test_session_destroy_preserves_session_on_disk(tmp_path: Path) -> None:
+    """Should preserve session file when destroyed (Chrome stays alive)."""
     manager = _make_manager()
     session_id = "destroy_session"
 
@@ -246,32 +246,27 @@ async def test_session_destroy_deletes_from_disk(tmp_path: Path) -> None:
         session_file = tmp_path / f"{session_id}.json"
         assert session_file.exists()
 
-        # Add instance to manager
+        # Add instance to manager (owns_chrome=True, isolated mode)
         instance = make_chrome_instance(session_id=session_id, pid=5678)
         instance.owns_chrome = True
         manager._instances[session_id] = instance
 
-        # Mock Chrome kill
-        with patch.object(manager, "_kill_instance_chrome"):
-            with patch.object(manager, "_disconnect_cdp"):
-                await manager.destroy(session_id)
+        await manager.destroy(session_id)
 
-                # Verify file was deleted
-                assert not session_file.exists()
-                # Verify instance removed
-                assert session_id not in manager._instances
+        # Session file should STILL EXIST (no-kill behavior preserves records)
+        assert session_file.exists()
+        # Verify instance removed from manager
+        assert session_id not in manager._instances
 
 
 @pytest.mark.asyncio
-async def test_cleanup_all_deletes_all_session_files(tmp_path: Path) -> None:
-    """Should delete all session files during cleanup."""
+async def test_cleanup_all_preserves_session_files(tmp_path: Path) -> None:
+    """Should preserve all session files during cleanup (Chrome stays alive)."""
     manager = _make_manager()
 
-    # Use real SessionStore with tmp_path
     with patch.object(SessionStore, "STORE_DIR", tmp_path):
         manager._session_store = SessionStore()
 
-        # Create multiple session records
         session_ids = ["session_1", "session_2", "session_3"]
         for sid in session_ids:
             record = SessionRecord(
@@ -287,20 +282,15 @@ async def test_cleanup_all_deletes_all_session_files(tmp_path: Path) -> None:
             instance.owns_chrome = True
             manager._instances[sid] = instance
 
-        # Verify files exist
         for sid in session_ids:
             assert (tmp_path / f"{sid}.json").exists()
 
-        # Mock Chrome operations
-        with patch.object(manager, "_kill_instance_chrome"):
-            with patch.object(manager, "_disconnect_cdp"):
-                with patch.object(manager, "_kill_shared_chrome"):
-                    await manager.cleanup_all()
+        manager._shared_browser_cdp = None
+        await manager.cleanup_all()
 
-        # Verify all files deleted
+        # Session files should STILL EXIST (no-kill behavior preserves records)
         for sid in session_ids:
-            assert not (tmp_path / f"{sid}.json").exists()
-        # Verify instances cleared
+            assert (tmp_path / f"{sid}.json").exists()
         assert len(manager._instances) == 0
 
 
@@ -370,58 +360,6 @@ async def test_reconnect_adopts_existing_tabs() -> None:
             assert "T1" in result.targets
             assert "T2" in result.targets
             assert "T3" in result.targets
-
-
-@pytest.mark.asyncio
-async def test_collect_all_pids_returns_all() -> None:
-    """Should collect PIDs from all instances and shared Chrome."""
-    manager = _make_manager()
-
-    # Add isolated instances with PIDs
-    instance1 = make_chrome_instance(session_id="session_1", pid=1001)
-    instance2 = make_chrome_instance(session_id="session_2", pid=1002)
-    instance3 = make_chrome_instance(session_id="session_3", pid=1003)
-
-    manager._instances["session_1"] = instance1
-    manager._instances["session_2"] = instance2
-    manager._instances["session_3"] = instance3
-
-    # Add shared Chrome PID
-    manager._shared_pid = 2000
-
-    pids = manager._collect_all_pids()
-
-    # Verify all PIDs collected
-    assert len(pids) == 4
-    assert 1001 in pids
-    assert 1002 in pids
-    assert 1003 in pids
-    assert 2000 in pids
-
-
-@pytest.mark.asyncio
-async def test_sync_kill_all_chrome_calls_kill() -> None:
-    """Should call kill command for each Chrome PID."""
-    manager = _make_manager()
-
-    # Add instances with PIDs
-    instance1 = make_chrome_instance(session_id="session_1", pid=1001)
-    instance2 = make_chrome_instance(session_id="session_2", pid=1002)
-    manager._instances["session_1"] = instance1
-    manager._instances["session_2"] = instance2
-    manager._shared_pid = 2000
-
-    with patch("wsl_chrome_mcp.chrome_pool.run_windows_command") as mock_run:
-        mock_run.return_value = MagicMock(returncode=0)
-
-        manager._sync_kill_all_chrome()
-
-        # Verify kill was called for each PID
-        assert mock_run.call_count == 3
-        calls = [call[0][0] for call in mock_run.call_args_list]
-        assert any("1001" in call for call in calls)
-        assert any("1002" in call for call in calls)
-        assert any("2000" in call for call in calls)
 
 
 @pytest.mark.asyncio
@@ -537,3 +475,114 @@ async def test_reconnect_from_record_adopts_new_target_when_original_gone() -> N
                 assert result.current_target_id == "T2"
                 assert "T2" in result.targets
                 assert "T3" in result.targets
+
+
+# --- No-Kill Behavior Tests ---
+
+
+@pytest.mark.asyncio
+async def test_cleanup_all_disconnects_cdp() -> None:
+    """Should call _disconnect_cdp for each instance during cleanup."""
+    manager = _make_manager()
+
+    instance1 = make_chrome_instance(session_id="ses_1")
+    instance2 = make_chrome_instance(session_id="ses_2")
+    manager._instances = {"ses_1": instance1, "ses_2": instance2}
+    manager._shared_browser_cdp = None
+
+    with patch.object(manager, "_disconnect_cdp", new_callable=AsyncMock) as mock_disconnect:
+        await manager.cleanup_all()
+
+    assert mock_disconnect.call_count == 2
+    disconnected_instances = [call.args[0] for call in mock_disconnect.call_args_list]
+    assert instance1 in disconnected_instances
+    assert instance2 in disconnected_instances
+
+
+@pytest.mark.asyncio
+async def test_cleanup_all_disconnects_shared_browser_cdp() -> None:
+    """Should close shared browser CDP during cleanup."""
+    manager = _make_manager()
+
+    mock_shared_cdp = MagicMock()
+    mock_shared_cdp.is_connected = True
+    mock_shared_cdp.close = AsyncMock()
+    manager._shared_browser_cdp = mock_shared_cdp
+
+    await manager.cleanup_all()
+
+    mock_shared_cdp.close.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_destroy_does_not_kill_even_with_owns_chrome() -> None:
+    """Should NOT kill Chrome process even when owns_chrome=True."""
+    manager = _make_manager()
+    session_id = "owns_chrome_session"
+
+    instance = make_chrome_instance(session_id=session_id, pid=9999)
+    instance.owns_chrome = True
+    manager._instances[session_id] = instance
+
+    with patch.object(manager, "_kill_instance_chrome", new_callable=AsyncMock) as mock_kill:
+        await manager.destroy(session_id)
+
+    mock_kill.assert_not_called()
+    assert session_id not in manager._instances
+
+
+def test_port_prepopulation_from_session_records(tmp_path: Path) -> None:
+    """Should pre-populate _used_ports from surviving session records."""
+    with patch.object(SessionStore, "STORE_DIR", tmp_path):
+        store = SessionStore()
+        store.save(
+            SessionRecord(
+                session_id="ses_1",
+                port=9300,
+                pid=None,
+                profile_mode="profile",
+            )
+        )
+        store.save(
+            SessionRecord(
+                session_id="ses_2",
+                port=9301,
+                pid=None,
+                profile_mode="profile",
+            )
+        )
+
+        with patch.object(ChromePoolManager, "_cleanup_orphaned_temp_dirs"):
+            manager = ChromePoolManager()
+
+        assert 9300 in manager._used_ports
+        assert 9301 in manager._used_ports
+
+
+@pytest.mark.asyncio
+async def test_session_records_survive_cleanup_all(tmp_path: Path) -> None:
+    """Should preserve all session records on disk after cleanup_all."""
+    manager = _make_manager()
+
+    with patch.object(SessionStore, "STORE_DIR", tmp_path):
+        manager._session_store = SessionStore()
+
+        for sid in ["ses_1", "ses_2"]:
+            record = SessionRecord(
+                session_id=sid,
+                port=9222,
+                pid=1234,
+                target_ids=["T1"],
+                current_target_id="T1",
+                profile_mode="isolated",
+            )
+            manager._session_store.save(record)
+            manager._instances[sid] = make_chrome_instance(session_id=sid)
+
+        manager._shared_browser_cdp = None
+        await manager.cleanup_all()
+
+        records = manager._session_store.list_all()
+        record_ids = {r.session_id for r in records}
+        assert "ses_1" in record_ids
+        assert "ses_2" in record_ids

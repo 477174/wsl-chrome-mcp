@@ -161,6 +161,7 @@ class TestChromePoolManagerSessions:
         assert result.session_id == "ses_new"
         assert result.owns_chrome is True
         assert result.browser_context_id is None
+
     @pytest.mark.asyncio
     async def test_get_or_create_profile_mode(self) -> None:
         """Profile mode should create shared session with browser context."""
@@ -178,7 +179,9 @@ class TestChromePoolManagerSessions:
         with (
             patch.object(manager, "_ensure_shared_chrome", new_callable=AsyncMock),
             patch.object(manager, "_connect_cdp", new_callable=AsyncMock),
-            patch.object(manager, "_create_profile_tab", new_callable=AsyncMock, return_value=("T_prof", 42)),
+            patch.object(
+                manager, "_create_profile_tab", new_callable=AsyncMock, return_value=("T_prof", 42)
+            ),
         ):
             result = await manager.get_or_create("ses_new")
         assert result.session_id == "ses_new"
@@ -231,17 +234,14 @@ class TestChromePoolManagerSessions:
 
     @pytest.mark.asyncio
     async def test_cleanup_all_destroys_all(self) -> None:
-        """Should destroy all instances and kill shared Chrome."""
+        """Should disconnect all instances without killing Chrome."""
         manager = _make_manager()
         instance1 = make_chrome_instance("ses_1", port=9222, browser_context_id="ctx_1")
         instance2 = make_chrome_instance("ses_2", port=9222, browser_context_id="ctx_2")
         manager._instances = {"ses_1": instance1, "ses_2": instance2}
+        manager._shared_browser_cdp = None
 
-        mock_browser_cdp = _make_mock_browser_cdp()
-        manager._browser_cdp = mock_browser_cdp
-
-        with patch.object(manager, "_kill_shared_chrome", new_callable=AsyncMock):
-            await manager.cleanup_all()
+        await manager.cleanup_all()
 
         assert len(manager._instances) == 0
 
@@ -277,6 +277,7 @@ class TestChromePoolManagerSessions:
         ):
             await manager.get_or_create("ses_fail")
         assert "ses_fail" not in manager._instances
+
 
 # --- Tab Operations Tests ---
 
