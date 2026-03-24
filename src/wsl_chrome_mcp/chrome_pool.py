@@ -1387,7 +1387,6 @@ class ChromePoolManager:
         await self._disconnect_cdp(instance)
 
         if instance.owns_chrome:
-            self._release_port(instance.port)
             logger.info(
                 "Detached isolated Chrome session %s (port %d, Chrome stays alive)",
                 session_id,
@@ -1439,13 +1438,17 @@ class ChromePoolManager:
             try:
                 instance = self._instances.pop(session_id)
                 await self._disconnect_cdp(instance)
+                if instance.instance_browser_cdp:
+                    with contextlib.suppress(Exception):
+                        await instance.instance_browser_cdp.disconnect()
+                    instance.instance_browser_cdp = None
             except Exception as e:
                 logger.warning("Error disconnecting session %s: %s", session_id, e)
 
-        if self._shared_browser_cdp and self._shared_browser_cdp.is_connected:
+        if self._browser_cdp and self._browser_cdp.is_connected:
             with contextlib.suppress(Exception):
-                await self._shared_browser_cdp.close()
-            self._shared_browser_cdp = None
+                await self._browser_cdp.close()
+            self._browser_cdp = None
 
     def list_sessions(self) -> dict[str, dict[str, Any]]:
         """List all active sessions.

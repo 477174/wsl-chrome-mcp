@@ -507,7 +507,7 @@ async def test_cleanup_all_disconnects_shared_browser_cdp() -> None:
     mock_shared_cdp = MagicMock()
     mock_shared_cdp.is_connected = True
     mock_shared_cdp.close = AsyncMock()
-    manager._shared_browser_cdp = mock_shared_cdp
+    manager._browser_cdp = mock_shared_cdp
 
     await manager.cleanup_all()
 
