@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import subprocess
+from collections.abc import Generator
 from datetime import datetime
+from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -131,15 +133,16 @@ class TestChromePoolManagerSessions:
     """Tests for session management with browser contexts."""
 
     @pytest.fixture(autouse=True)
-    def _clean_session_store(self) -> None:
-        from wsl_chrome_mcp.session_store import SessionStore
+    def _clean_session_store(self, tmp_path: Path) -> Generator[None, None, None]:
+        """Redirect session store to temp dir to protect production records."""
+        import wsl_chrome_mcp.session_store as ss_mod
 
-        store = SessionStore()
-        for record in store.list_all():
-            store.delete(record.session_id)
+        original_dir = ss_mod.SessionStore.STORE_DIR
+        test_dir = tmp_path / "sessions"
+        test_dir.mkdir(exist_ok=True)
+        ss_mod.SessionStore.STORE_DIR = test_dir
         yield
-        for record in store.list_all():
-            store.delete(record.session_id)
+        ss_mod.SessionStore.STORE_DIR = original_dir
 
     @pytest.mark.asyncio
     async def test_get_or_create_returns_existing(self) -> None:
