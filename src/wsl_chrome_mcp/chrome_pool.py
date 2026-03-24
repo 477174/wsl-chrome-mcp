@@ -14,6 +14,7 @@ import asyncio
 import contextlib
 import logging
 import re
+import socket
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any
@@ -272,6 +273,13 @@ class ChromePoolManager:
 
     # --- Port allocation (isolated mode) ---
 
+    def _is_port_in_use(self, port: int) -> bool:
+        try:
+            with socket.create_connection(("127.0.0.1", port), timeout=0.5):
+                return True
+        except (ConnectionRefusedError, TimeoutError, OSError):
+            return False
+
     def _allocate_port(self) -> int:
         """Find next available port in range.
 
@@ -282,10 +290,15 @@ class ChromePoolManager:
             RuntimeError: If no ports are available.
         """
         for port in range(self._port, self._port_max):
-            if port not in self._used_ports:
+            if port in self._used_ports:
+                continue
+            if self._is_port_in_use(port):
+                logger.debug("Port %d in use (OS probe), skipping", port)
                 self._used_ports.add(port)
-                logger.debug("Allocated port %d", port)
-                return port
+                continue
+            self._used_ports.add(port)
+            logger.debug("Allocated port %d", port)
+            return port
         raise RuntimeError(
             f"No available ports in range {self._port}-{self._port_max}. "
             f"Too many concurrent sessions ({len(self._used_ports)})."
@@ -1116,6 +1129,20 @@ class ChromePoolManager:
         tab is used (no forced about:blank, no BrowserContext).
         """
         port = self._allocate_port()
+
+        self._session_store.save(
+            SessionRecord(
+                session_id=session_id,
+                port=port,
+                pid=None,
+                target_ids=[],
+                current_target_id=None,
+                profile_mode="isolated",
+                created_at=datetime.now().isoformat(),
+                browser_context_id=None,
+            )
+        )
+
         chrome_path = await self._find_chrome_path()
 
         # Create temp directory on Windows
