@@ -130,6 +130,17 @@ class TestChromeInstance:
 class TestChromePoolManagerSessions:
     """Tests for session management with browser contexts."""
 
+    @pytest.fixture(autouse=True)
+    def _clean_session_store(self) -> None:
+        from wsl_chrome_mcp.session_store import SessionStore
+
+        store = SessionStore()
+        for record in store.list_all():
+            store.delete(record.session_id)
+        yield
+        for record in store.list_all():
+            store.delete(record.session_id)
+
     @pytest.mark.asyncio
     async def test_get_or_create_returns_existing(self) -> None:
         """Should return cached instance on second call."""
